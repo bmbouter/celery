@@ -85,6 +85,12 @@ class redistore(default):
 
 
 @template()
+class qpid(default):
+    BROKER_URL = os.environ.get('CSTRESS_BROKER', 'qpid://')
+    CELERY_RESULT_BACKEND = 'mongodb://127.0.0.1/'
+
+
+@template()
 class acks_late(default):
     CELERY_ACKS_LATE = True
 
