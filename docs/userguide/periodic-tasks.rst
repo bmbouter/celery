@@ -188,7 +188,8 @@ The syntax of these crontab expressions are very flexible.  Some examples:
 | ``crontab(minute=0, hour=0)``           | Execute daily at midnight.                 |
 +-----------------------------------------+--------------------------------------------+
 | ``crontab(minute=0, hour='*/3')``       | Execute every three hours:                 |
-|                                         | 3am, 6am, 9am, noon, 3pm, 6pm, 9pm.        |
+|                                         | midnight, 3am, 6am, 9am,                   |
+|                                         | noon, 3pm, 6pm, 9pm.                       |
 +-----------------------------------------+--------------------------------------------+
 | ``crontab(minute=0,``                   | Same as previous.                          |
 |         ``hour='0,3,6,9,12,15,18,21')`` |                                            |
@@ -219,20 +220,20 @@ The syntax of these crontab expressions are very flexible.  Some examples:
 | ``crontab(minute=0, hour='*/3,8-17')``  | Execute every hour divisible by 3, and     |
 |                                         | every hour during office hours (8am-5pm).  |
 +-----------------------------------------+--------------------------------------------+
-| ``crontab(day_of_month='2')``           | Execute on the second day of every month.  |
+| ``crontab(0, 0, 0, day_of_month='2')``  | Execute on the second day of every month.  |
 |                                         |                                            |
 +-----------------------------------------+--------------------------------------------+
-| ``crontab(day_of_month='2-30/3')``      | Execute on every even numbered day.        |
-|                                         |                                            |
+| ``crontab(0, 0, 0,'``                   | Execute on every even numbered day.        |
+|         ``day_of_month='2-30/3')``      |                                            |
 +-----------------------------------------+--------------------------------------------+
-| ``crontab(day_of_month='1-7,15-21')``   | Execute on the first and third weeks of    |
-|                                         | the month.                                 |
+| ``crontab(0, 0, 0,``                    | Execute on the first and third weeks of    |
+|         ``day_of_month='1-7,15-21')``   | the month.                                 |
 +-----------------------------------------+--------------------------------------------+
-| ``crontab(day_of_month='11',``          | Execute on 11th of May every year.         |
-|         ``month_of_year='5')``          |                                            |
+| ``crontab(0, 0, 0, day_of_month='11',`` | Execute on 11th of May every year.         |
+|          ``month_of_year='5')``         |                                            |
 +-----------------------------------------+--------------------------------------------+
-| ``crontab(month_of_year='*/3')``        | Execute on the first month of every        |
-|                                         | quarter.                                   |
+| ``crontab(0, 0, 0,``                    | Execute on the first month of every        |
+|         ``month_of_year='*/3')``        | quarter.                                   |
 +-----------------------------------------+--------------------------------------------+
 
 See :class:`celery.schedules.crontab` for more documentation.
@@ -246,7 +247,7 @@ To start the :program:`celery beat` service:
 
 .. code-block:: bash
 
-    $ celery beat
+    $ celery -A proj beat
 
 You can also start embed `beat` inside the worker by enabling
 workers `-B` option, this is convenient if you will never run
@@ -255,7 +256,7 @@ reason is not recommended for production use:
 
 .. code-block:: bash
 
-    $ celery worker -B
+    $ celery -A proj worker -B
 
 Beat needs to store the last run times of the tasks in a local database
 file (named `celerybeat-schedule` by default), so it needs access to
@@ -264,7 +265,7 @@ location for this file:
 
 .. code-block:: bash
 
-    $ celery beat -s /home/celery/var/run/celerybeat-schedule
+    $ celery -A proj beat -s /home/celery/var/run/celerybeat-schedule
 
 
 .. note::

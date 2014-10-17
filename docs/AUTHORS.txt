@@ -21,6 +21,7 @@ Ben Firshman <ben@firshman.co.uk>
 Brad Jasper <bjasper@gmail.com>
 Branko Čibej <brane@apache.org>
 Brendon Crawford <brendon@aphexcreations.net>
+Brian Bouterse <bmbouter@redhat.com>
 Brian Rosner <brosner@gmail.com>
 Bryan Berg <bryan@mixedmedialabs.com>
 Chase Seibert <chase.seibert+github@gmail.com>
@@ -68,6 +69,7 @@ Jeff Terrace <jterrace@gmail.com>
 Jerzy Kozera <jerzy.kozera@gmail.com>
 Jesper Noehr <jesper@noehr.org>
 John Watson <johnw@mahalo.com>
+John Whitlock <john-whitlock@ieee.org>
 Jonas Haag <jonas@lophus.org>
 Jonas Obrist <me@ojii.ch>
 Jonatan Heyman <jonatan@heyman.info>

@@ -129,7 +129,10 @@ class test_task_retries(TasksCase):
         try:
             with self.assertRaises(Retry):
                 import sys
-                sys.exc_clear()
+                try:
+                    sys.exc_clear()
+                except AttributeError:
+                    pass
                 self.retry_task_mockapply.retry(args=[4, 4], kwargs=None)
         finally:
             self.retry_task_mockapply.pop_request()
@@ -232,7 +235,7 @@ class test_tasks(TasksCase):
 
     def assertNextTaskDataEqual(self, consumer, presult, task_name,
                                 test_eta=False, test_expires=False, **kwargs):
-        next_task = consumer.queues[0].get(accept=['pickle'])
+        next_task = consumer.queues[0].get(accept=['pickle', 'json'])
         task_data = next_task.decode()
         self.assertEqual(task_data['id'], presult.id)
         self.assertEqual(task_data['task'], task_name)
@@ -354,15 +357,6 @@ class test_tasks(TasksCase):
             request.clear()
         finally:
             self.mytask.pop_request()
-
-    def test_task_class_repr(self):
-        self.assertIn('class Task of', repr(self.mytask.app.Task))
-        self.mytask.app.Task._app = None
-        self.assertIn('unbound', repr(self.mytask.app.Task, ))
-
-    def test_bind_no_magic_kwargs(self):
-        self.mytask.accept_magic_kwargs = None
-        self.mytask.bind(self.mytask.app)
 
     def test_annotate(self):
         with patch('celery.app.task.resolve_all_annotations') as anno:

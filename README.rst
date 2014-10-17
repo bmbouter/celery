@@ -44,7 +44,7 @@ What do I need?
 
 Celery version 3.0 runs on,
 
-- Python (2.5, 2.6, 2.7, 3.2, 3.3)
+- Python (2.6, 2.7, 3.3, 3.4)
 - PyPy (1.8, 1.9)
 - Jython (2.5, 2.7).
 
@@ -82,7 +82,7 @@ getting started tutorials:
     http://docs.celeryproject.org/en/latest/getting-started/next-steps.html
 
 Celery is...
-============
+==========
 
 - **Simple**
 
@@ -120,7 +120,7 @@ Celery is...
     schedulers, consumers, producers, autoscalers, broker transports and much more.
 
 It supports...
-==============
+============
 
     - **Message Transports**
 
@@ -234,9 +234,9 @@ by using brackets.  Multiple bundles can be specified by separating them by
 commas.
 ::
 
-    $ pip install celery[librabbitmq]
+    $ pip install "celery[librabbitmq]"
 
-    $ pip install celery[librabbitmq,redis,auth,msgpack]
+    $ pip install "celery[librabbitmq,redis,auth,msgpack]"
 
 The following bundles are available:
 

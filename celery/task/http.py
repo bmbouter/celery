@@ -8,7 +8,6 @@
 """
 from __future__ import absolute_import
 
-import anyjson
 import sys
 
 try:
@@ -17,6 +16,8 @@ except ImportError:  # pragma: no cover
     from urllib import urlencode              # noqa
     from urlparse import urlparse, parse_qsl  # noqa
 
+from kombu.utils import json
+
 from celery import shared_task, __version__ as celery_version
 from celery.five import items, reraise
 from celery.utils.log import get_task_logger
@@ -24,7 +25,7 @@ from celery.utils.log import get_task_logger
 __all__ = ['InvalidResponseError', 'RemoteExecuteError', 'UnknownStatusError',
            'HttpDispatch', 'dispatch', 'URL']
 
-GET_METHODS = frozenset(['GET', 'HEAD'])
+GET_METHODS = {'GET', 'HEAD'}
 logger = get_task_logger(__name__)
 
 
@@ -62,7 +63,7 @@ class UnknownStatusError(InvalidResponseError):
     """The remote server gave an unknown status."""
 
 
-def extract_response(raw_response, loads=anyjson.loads):
+def extract_response(raw_response, loads=json.loads):
     """Extract the response text from a raw JSON response."""
     if not raw_response:
         raise InvalidResponseError('Empty response')
@@ -162,8 +163,7 @@ class HttpDispatch(object):
         return headers
 
 
-@shared_task(name='celery.http_dispatch', bind=True,
-             url=None, method=None, accept_magic_kwargs=False)
+@shared_task(name='celery.http_dispatch', bind=True, url=None, method=None)
 def dispatch(self, url=None, method='GET', **kwargs):
     """Task dispatching to an URL.
 

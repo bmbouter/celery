@@ -298,12 +298,12 @@ and creating Celery applications.
 
     .. attribute:: Celery.AsyncResult
 
-        Create new result instance. See :class:`~celery.result.AsyncResult`.
+        Create new result instance. See :class:`celery.result.AsyncResult`.
 
     .. attribute:: Celery.GroupResult
 
         Create new group result instance.
-        See :class:`~celery.result.GroupResult`.
+        See :class:`celery.result.GroupResult`.
 
     .. method:: Celery.worker_main(argv=None)
 
@@ -382,9 +382,17 @@ and creating Celery applications.
         Finalizes the app by loading built-in tasks,
         and evaluating pending task decorators
 
-    .. method:: Celery.on_configure()
+    .. data:: on_configure
 
-        Optional callback for when the first time the configured is required.
+        Signal sent when app is loading configuration.
+
+    .. data:: on_after_configure
+
+        Signal sent after app has prepared the configuration.
+
+    .. data:: on_after_finalize
+
+        Signal sent after app has been finalized.
 
     .. attribute:: Celery.Pickler
 
@@ -408,7 +416,7 @@ See :ref:`guide-canvas` for more about creating task workflows.
     A group is lazy so you must call it to take action and evaluate
     the group.
 
-    Will return a `group` task that when called will then call of the
+    Will return a `group` task that when called will then call all of the
     tasks in the group (and return a :class:`GroupResult` instance
     that can be used to inspect the state of the group).
 
@@ -462,7 +470,7 @@ See :ref:`guide-canvas` for more about creating task workflows.
 
     Signatures can also be created from tasks::
 
-        >>> add.subtask(args=(), kwargs={}, options={})
+        >>> add.signature(args=(), kwargs={}, options={})
 
     or the ``.s()`` shortcut::
 

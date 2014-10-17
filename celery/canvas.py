@@ -12,14 +12,15 @@
 """
 from __future__ import absolute_import
 
+from collections import MutableSequence, deque
 from copy import deepcopy
 from functools import partial as _partial, reduce
 from operator import itemgetter
 from itertools import chain as _chain
 
-from kombu.utils import cached_property, fxrange, kwdict, reprcall, uuid
+from kombu.utils import cached_property, fxrange, reprcall, uuid
 
-from celery._state import current_app
+from celery._state import current_app, get_current_worker_task
 from celery.utils.functional import (
     maybe_list, is_list, regen,
     chunks as _chunks,
@@ -98,6 +99,10 @@ def maybe_unroll_group(g):
         return g.tasks[0] if size == 1 else g
 
 
+def task_name_from(task):
+    return getattr(task, 'name', task)
+
+
 class Signature(dict):
     """Class that wraps the arguments and execution options
     for a single task invocation.
@@ -132,7 +137,7 @@ class Signature(dict):
     def from_dict(self, d, app=None):
         typ = d.get('subtask_type')
         if typ:
-            return self.TYPES[typ].from_dict(kwdict(d), app=app)
+            return self.TYPES[typ].from_dict(d, app=app)
         return Signature(d, app=app)
 
     def __init__(self, task=None, args=None, kwargs=None, options=None,
@@ -194,12 +199,13 @@ class Signature(dict):
         return s
     partial = clone
 
-    def freeze(self, _id=None, group_id=None, chord=None):
+    def freeze(self, _id=None, group_id=None, chord=None, root_id=None):
         opts = self.options
         try:
             tid = opts['task_id']
         except KeyError:
             tid = opts['task_id'] = _id or uuid()
+        root_id = opts.setdefault('root_id', root_id)
         if 'reply_to' not in opts:
             opts['reply_to'] = self.app.oid
         if group_id:
@@ -228,7 +234,7 @@ class Signature(dict):
     def set_immutable(self, immutable):
         self.immutable = immutable
 
-    def apply_async(self, args=(), kwargs={}, **options):
+    def apply_async(self, args=(), kwargs={}, route_name=None, **options):
         try:
             _apply = self._apply_async
         except IndexError:  # no tasks for chain, etc to find type
@@ -242,6 +248,8 @@ class Signature(dict):
 
     def append_to_list_option(self, key, value):
         items = self.options.setdefault(key, [])
+        if not isinstance(items, MutableSequence):
+            items = self.options[key] = [items]
         if value not in items:
             items.append(value)
         return value
@@ -282,7 +290,10 @@ class Signature(dict):
     def __reduce__(self):
         # for serialization, the task type is lazily loaded,
         # and not stored in the dict itself.
-        return subtask, (dict(self), )
+        return signature, (dict(self), )
+
+    def __json__(self):
+        return dict(self)
 
     def reprcall(self, *args, **kwargs):
         args, kwargs, _ = self._merge(args, kwargs, {})
@@ -301,6 +312,11 @@ class Signature(dict):
 
     def __repr__(self):
         return self.reprcall()
+
+    @property
+    def name(self):
+        # for duck typing compatibility with Task.name
+        return self.task
 
     @cached_property
     def type(self):
@@ -334,6 +350,7 @@ class Signature(dict):
 
 @Signature.register_type
 class chain(Signature):
+    tasks = _getitem_property('kwargs.tasks')
 
     def __init__(self, *tasks, **options):
         tasks = (regen(tasks[0]) if len(tasks) == 1 and is_list(tasks[0])
@@ -341,27 +358,133 @@ class chain(Signature):
         Signature.__init__(
             self, 'celery.chain', (), {'tasks': tasks}, **options
         )
-        self.tasks = tasks
         self.subtask_type = 'chain'
 
     def __call__(self, *args, **kwargs):
         if self.tasks:
             return self.apply_async(args, kwargs)
 
+    def apply_async(self, args=(), kwargs={}, **options):
+        # python is best at unpacking kwargs, so .run is here to do that.
+        app = self.app
+        if app.conf.CELERY_ALWAYS_EAGER:
+            return self.apply(args, kwargs, **options)
+        return self.run(args, kwargs, app=app, **(
+            dict(self.options, **options) if options else self.options))
+
+    def run(self, args=(), kwargs={}, group_id=None, chord=None,
+            task_id=None, link=None, link_error=None,
+            publisher=None, producer=None, root_id=None, app=None, **options):
+        app = app or self.app
+        args = tuple(args) + tuple(self.args)
+        tasks, results = self.prepare_steps(
+            args, self.tasks, root_id, link_error,
+        )
+        if not results:
+            return
+        result = results[-1]
+        last_task = tasks[-1]
+        if group_id:
+            last_task.set(group_id=group_id)
+        if chord:
+            last_task.set(chord=chord)
+        if task_id:
+            last_task.set(task_id=task_id)
+            result = last_task.type.AsyncResult(task_id)
+        # make sure we can do a link() and link_error() on a chain object.
+        if link:
+            tasks[-1].set(link=link)
+        tasks[0].apply_async(**options)
+        return result
+
+    def prepare_steps(self, args, tasks,
+                      root_id=None, link_error=None, app=None,
+                      from_dict=Signature.from_dict):
+        app = app or self.app
+        steps = deque(tasks)
+        next_step = prev_task = prev_res = None
+        tasks, results = [], []
+        i = 0
+        while steps:
+            task = steps.popleft()
+            if not isinstance(task, Signature):
+                task = from_dict(task, app=app)
+            if not i:  # first task
+                # first task gets partial args from chain
+                task = task.clone(args)
+                res = task.freeze(root_id=root_id)
+                root_id = res.id if root_id is None else root_id
+            else:
+                task = task.clone()
+                res = task.freeze(root_id=root_id)
+            i += 1
+
+            if isinstance(task, group):
+                task = maybe_unroll_group(task)
+
+            if isinstance(task, chain):
+                # splice the chain
+                steps.extendleft(reversed(task.tasks))
+                continue
+            elif isinstance(task, group) and steps and \
+                    not isinstance(steps[0], group):
+                # automatically upgrade group(...) | s to chord(group, s)
+                try:
+                    next_step = steps.popleft()
+                    # for chords we freeze by pretending it's a normal
+                    # signature instead of a group.
+                    res = Signature.freeze(next_step)
+                    task = chord(
+                        task, body=next_step,
+                        task_id=res.task_id, root_id=root_id,
+                    )
+                except IndexError:
+                    pass  # no callback, so keep as group.
+
+            if prev_task:
+                # link previous task to this task.
+                prev_task.link(task)
+                # set AsyncResult.parent
+                if not res.parent:
+                    res.parent = prev_res
+
+            if link_error:
+                task.set(link_error=link_error)
+
+            if not isinstance(prev_task, chord):
+                results.append(res)
+                tasks.append(task)
+            prev_task, prev_res = task, res
+
+        return tasks, results
+
+    def apply(self, args=(), kwargs={}, **options):
+        last, fargs = None, args
+        for task in self.tasks:
+            res = task.clone(fargs).apply(
+                last and (last.get(), ), **dict(self.options, **options))
+            res.parent, last, fargs = last, res, None
+        return last
+
     @classmethod
     def from_dict(self, d, app=None):
         tasks = d['kwargs']['tasks']
-        if d['args'] and tasks:
-            # partial args passed on to first task in chain (Issue #1057).
-            tasks[0]['args'] = tasks[0]._merge(d['args'])[0]
-        return chain(*d['kwargs']['tasks'], app=app, **kwdict(d['options']))
+        if tasks:
+            if isinstance(tasks, tuple):  # aaaargh
+                tasks = d['kwargs']['tasks'] = list(tasks)
+            # First task must be signature object to get app
+            tasks[0] = maybe_signature(tasks[0], app=app)
+        return chain(*tasks, app=app, **d['options'])
 
     @property
-    def type(self):
-        try:
-            return self._type or self.tasks[0].type.app.tasks['celery.chain']
-        except KeyError:
-            return self.app.tasks['celery.chain']
+    def app(self):
+        app = self._app
+        if app is None:
+            try:
+                app = self.tasks[0]._app
+            except (KeyError, IndexError):
+                pass
+        return app or current_app
 
     def __repr__(self):
         return ' | '.join(repr(t) for t in self.tasks)
@@ -381,7 +504,8 @@ class _basemap(Signature):
         # need to evaluate generators
         task, it = self._unpack_args(self.kwargs)
         return self.type.apply_async(
-            (), {'task': task, 'it': list(it)}, **opts
+            (), {'task': task, 'it': list(it)},
+            route_name=task_name_from(self.kwargs.get('task')), **opts
         )
 
     @classmethod
@@ -425,10 +549,13 @@ class chunks(Signature):
         return chunks(*self._unpack_args(d['kwargs']), app=app, **d['options'])
 
     def apply_async(self, args=(), kwargs={}, **opts):
-        return self.group().apply_async(args, kwargs, **opts)
+        return self.group().apply_async(
+            args, kwargs,
+            route_name=task_name_from(self.kwargs.get('task')), **opts
+        )
 
     def __call__(self, **options):
-        return self.group()(**options)
+        return self.apply_async(**options)
 
     def group(self):
         # need to evaluate generators
@@ -452,13 +579,9 @@ def _maybe_group(tasks):
     return tasks
 
 
-def _maybe_clone(tasks, app):
-    return [s.clone() if isinstance(s, Signature) else signature(s, app=app)
-            for s in tasks]
-
-
 @Signature.register_type
 class group(Signature):
+    tasks = _getitem_property('kwargs.tasks')
 
     def __init__(self, *tasks, **options):
         if len(tasks) == 1:
@@ -466,24 +589,78 @@ class group(Signature):
         Signature.__init__(
             self, 'celery.group', (), {'tasks': tasks}, **options
         )
-        self.tasks, self.subtask_type = tasks, 'group'
+        self.subtask_type = 'group'
 
     @classmethod
     def from_dict(self, d, app=None):
-        tasks = d['kwargs']['tasks']
-        if d['args'] and tasks:
-            # partial args passed on to all tasks in the group (Issue #1057).
-            for task in tasks:
-                task['args'] = task._merge(d['args'])[0]
-        return group(tasks, app=app, **kwdict(d['options']))
+        return group(d['kwargs']['tasks'], app=app, **d['options'])
 
-    def apply_async(self, args=(), kwargs=None, add_to_parent=True, **options):
-        tasks = _maybe_clone(self.tasks, app=self._app)
-        if not tasks:
+    def _prepared(self, tasks, partial_args, group_id, root_id, app, dict=dict,
+                  Signature=Signature, from_dict=Signature.from_dict):
+        for task in tasks:
+            if isinstance(task, dict):
+                if isinstance(task, Signature):
+                    # local sigs are always of type Signature, and we
+                    # clone them to make sure we do not modify the originals.
+                    task = task.clone()
+                else:
+                    # serialized sigs must be converted to Signature.
+                    task = from_dict(task, app=app)
+                if isinstance(task, group):
+                    # needs yield_from :(
+                    unroll = task._prepared(
+                        task.tasks, partial_args, group_id, root_id, app,
+                    )
+                    for taskN, resN in unroll:
+                        yield taskN, resN
+                else:
+                    if partial_args and not task.immutable:
+                        task.args = tuple(partial_args) + tuple(task.args)
+                    yield task, task.freeze(group_id=group_id, root_id=root_id)
+
+    def _apply_tasks(self, tasks, producer=None, app=None, **options):
+        app = app or self.app
+        with app.producer_or_acquire(producer) as producer:
+            for sig, res in tasks:
+                sig.apply_async(producer=producer, add_to_parent=False,
+                                **options)
+                yield res
+
+    def _freeze_gid(self, options):
+        # remove task_id and use that as the group_id,
+        # if we don't remove it then every task will have the same id...
+        options = dict(self.options, **options)
+        options['group_id'] = group_id = (
+            options.pop('task_id', uuid()))
+        return options, group_id, options.get('root_id')
+
+    def apply_async(self, args=(), kwargs=None, add_to_parent=True,
+                    producer=None, **options):
+        app = self.app
+        if app.conf.CELERY_ALWAYS_EAGER:
+            return self.apply(args, kwargs, **options)
+        if not self.tasks:
             return self.freeze()
-        type = self.type
-        return type(*type.prepare(dict(self.options, **options), tasks, args),
-                    add_to_parent=add_to_parent)
+
+        options, group_id, root_id = self._freeze_gid(options)
+        tasks = self._prepared(self.tasks, args, group_id, root_id, app)
+        result = self.app.GroupResult(
+            group_id, list(self._apply_tasks(tasks, producer, app, **options)),
+        )
+        parent_task = get_current_worker_task()
+        if add_to_parent and parent_task:
+            parent_task.add_trail(result)
+        return result
+
+    def apply(self, args=(), kwargs={}, **options):
+        app = self.app
+        if not self.tasks:
+            return self.freeze()  # empty group returns GroupResult
+        options, group_id, root_id = self._freeze_gid(options)
+        tasks = self._prepared(self.tasks, args, group_id, root_id, app)
+        return app.GroupResult(group_id, [
+            sig.apply(**options) for sig, _ in tasks
+        ])
 
     def set_immutable(self, immutable):
         for task in self.tasks:
@@ -498,15 +675,21 @@ class group(Signature):
         sig = sig.clone().set(immutable=True)
         return self.tasks[0].link_error(sig)
 
-    def apply(self, *args, **kwargs):
-        if not self.tasks:
-            return self.freeze()  # empty group returns GroupResult
-        return Signature.apply(self, *args, **kwargs)
-
     def __call__(self, *partial_args, **options):
         return self.apply_async(partial_args, **options)
 
-    def freeze(self, _id=None, group_id=None, chord=None):
+    def _freeze_unroll(self, new_tasks, group_id, chord, root_id):
+        stack = deque(self.tasks)
+        while stack:
+            task = maybe_signature(stack.popleft(), app=self._app).clone()
+            if isinstance(task, group):
+                stack.extendleft(task.tasks)
+            else:
+                new_tasks.append(task)
+                yield task.freeze(group_id=group_id,
+                                  chord=chord, root_id=root_id)
+
+    def freeze(self, _id=None, group_id=None, chord=None, root_id=None):
         opts = self.options
         try:
             gid = opts['task_id']
@@ -515,13 +698,18 @@ class group(Signature):
         if group_id:
             opts['group_id'] = group_id
         if chord:
-            opts['chord'] = group_id
-        new_tasks, results = [], []
-        for task in self.tasks:
-            task = maybe_signature(task, app=self._app).clone()
-            results.append(task.freeze(group_id=group_id, chord=chord))
-            new_tasks.append(task)
-        self.tasks = self.kwargs['tasks'] = new_tasks
+            opts['chord'] = chord
+        root_id = opts.setdefault('root_id', root_id)
+        new_tasks = []
+        # Need to unroll subgroups early so that chord gets the
+        # right result instance for chord_unlock etc.
+        results = list(self._freeze_unroll(
+            new_tasks, group_id, chord, root_id,
+        ))
+        if isinstance(self.tasks, MutableSequence):
+            self.tasks[:] = new_tasks
+        else:
+            self.tasks = new_tasks
         return self.app.GroupResult(gid, results)
     _freeze = freeze
 
@@ -538,14 +726,14 @@ class group(Signature):
         return repr(self.tasks)
 
     @property
-    def type(self):
-        if self._type:
-            return self._type
-        # taking the app from the first task in the list, there may be a
-        # better solution for this, e.g. to consolidate tasks with the same
-        # app and apply them in batches.
-        app = self._app if self._app else self.tasks[0].type.app
-        return app.tasks[self['task']]
+    def app(self):
+        app = self._app
+        if app is None:
+            try:
+                app = self.tasks[0].app
+            except (KeyError, IndexError):
+                pass
+        return app if app is not None else current_app
 
 
 @Signature.register_type
@@ -560,13 +748,13 @@ class chord(Signature):
         )
         self.subtask_type = 'chord'
 
-    def freeze(self, _id=None, group_id=None, chord=None):
-        return self.body.freeze(_id, group_id=group_id, chord=chord)
+    def freeze(self, *args, **kwargs):
+        return self.body.freeze(*args, **kwargs)
 
     @classmethod
     def from_dict(self, d, app=None):
-        args, d['kwargs'] = self._unpack_args(**kwdict(d['kwargs']))
-        return self(*args, app=app, **kwdict(d))
+        args, d['kwargs'] = self._unpack_args(**d['kwargs'])
+        return self(*args, app=app, **d)
 
     @staticmethod
     def _unpack_args(header=None, body=None, **kwargs):
@@ -574,20 +762,17 @@ class chord(Signature):
         # than manually popping things off.
         return (header, body), kwargs
 
-    @property
-    def type(self):
-        if self._type:
-            return self._type
-        # we will be able to fix this mess in 3.2 when we no longer
-        # require an actual task implementation for chord/group
-        if self._app:
-            app = self._app
-        else:
-            try:
-                app = self.tasks[0].type.app
-            except IndexError:
-                app = self.body.type.app
-        return app.tasks['celery.chord']
+    @cached_property
+    def app(self):
+        return self._get_app(self.body)
+
+    def _get_app(self, body=None):
+        app = self._app
+        if app is None:
+            app = self.tasks[0]._app
+            if app is None and body is not None:
+                app = body._app
+        return app if app is not None else current_app
 
     def apply_async(self, args=(), kwargs={}, task_id=None,
                     producer=None, publisher=None, connection=None,
@@ -595,14 +780,59 @@ class chord(Signature):
         body = kwargs.get('body') or self.kwargs['body']
         kwargs = dict(self.kwargs, **kwargs)
         body = body.clone(**options)
+        app = self._get_app(body)
+        tasks = (self.tasks.clone() if isinstance(self.tasks, group)
+                 else group(self.tasks))
+        if app.conf.CELERY_ALWAYS_EAGER:
+            return self.apply((), kwargs,
+                              body=body, task_id=task_id, **options)
+        return self.run(tasks, body, args, task_id=task_id, **options)
 
-        _chord = self.type
-        if _chord.app.conf.CELERY_ALWAYS_EAGER:
-            return self.apply((), kwargs, task_id=task_id, **options)
-        res = body.freeze(task_id)
-        parent = _chord(self.tasks, body, args, **options)
-        res.parent = parent
-        return res
+    def apply(self, args=(), kwargs={}, propagate=True, body=None, **options):
+        body = self.body if body is None else body
+        tasks = (self.tasks.clone() if isinstance(self.tasks, group)
+                 else group(self.tasks))
+        return body.apply(
+            args=(tasks.apply().get(propagate=propagate), ),
+        )
+
+    def _traverse_tasks(self, tasks, value=None):
+        stack = deque(tasks)
+        while stack:
+            task = stack.popleft()
+            if isinstance(task, group):
+                stack.extend(task.tasks)
+            else:
+                yield task if value is None else value
+
+    def __length_hint__(self):
+        return sum(self._traverse_tasks(self.tasks, 1))
+
+    def run(self, header, body, partial_args, app=None, interval=None,
+            countdown=1, max_retries=None, propagate=None, eager=False,
+            task_id=None, **options):
+        app = app or self._get_app(body)
+        propagate = (app.conf.CELERY_CHORD_PROPAGATES
+                     if propagate is None else propagate)
+        group_id = uuid()
+        root_id = body.options.get('root_id')
+        if 'chord_size' not in body:
+            body['chord_size'] = self.__length_hint__()
+        options = dict(self.options, **options) if options else self.options
+        if options:
+            body.options.update(options)
+
+        results = header.freeze(
+            group_id=group_id, chord=body, root_id=root_id).results
+        bodyres = body.freeze(task_id, root_id=root_id)
+
+        parent = app.backend.apply_chord(
+            header, partial_args, group_id, body,
+            interval=interval, countdown=countdown,
+            options=options, max_retries=max_retries,
+            propagate=propagate, result=results)
+        bodyres.parent = parent
+        return bodyres
 
     def __call__(self, body=None, **options):
         return self.apply_async((), {'body': body} if body else {}, **options)
@@ -639,7 +869,7 @@ class chord(Signature):
 
 
 def signature(varies, *args, **kwargs):
-    if not (args or kwargs) and isinstance(varies, dict):
+    if isinstance(varies, dict):
         if isinstance(varies, Signature):
             return varies.clone()
         return Signature.from_dict(varies)
@@ -651,9 +881,10 @@ def maybe_signature(d, app=None):
     if d is not None:
         if isinstance(d, dict):
             if not isinstance(d, Signature):
-                return signature(d, app=app)
+                d = signature(d)
         elif isinstance(d, list):
             return [maybe_signature(s, app=app) for s in d]
+
         if app is not None:
             d._app = app
         return d

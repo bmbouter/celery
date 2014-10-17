@@ -2,13 +2,13 @@ from __future__ import absolute_import
 
 import os
 
-from functools import partial
-
 from celery.five import items
 from kombu import Exchange, Queue
 from kombu.utils import symbol_by_name
 
-CSTRESS_QUEUE = os.environ.get('CSTRESS_QUEUE_NAME', 'c.stress')
+CSTRESS_TRANS = os.environ.get('CSTRESS_TRANS', False)
+default_queue = 'c.stress.trans' if CSTRESS_TRANS else 'c.stress'
+CSTRESS_QUEUE = os.environ.get('CSTRESS_QUEUE_NAME', default_queue)
 
 templates = {}
 
@@ -23,7 +23,12 @@ def template(name=None):
 
 def use_template(app, template='default'):
     template = template.split(',')
-    app.after_configure = partial(mixin_templates, template[1:])
+
+    # mixin the rest of the templates when the config is needed
+    @app.on_after_configure.connect(weak=False)
+    def load_template(sender, source, **kwargs):
+        mixin_templates(template[1:], source)
+
     app.config_from_object(templates[template[0]])
 
 
@@ -54,7 +59,9 @@ class default(object):
     CELERY_QUEUES = [
         Queue(CSTRESS_QUEUE,
               exchange=Exchange(CSTRESS_QUEUE),
-              routing_key=CSTRESS_QUEUE),
+              routing_key=CSTRESS_QUEUE,
+              durable=not CSTRESS_TRANS,
+              no_ack=CSTRESS_TRANS),
     ]
     CELERY_MAX_CACHED_RESULTS = -1
     BROKER_URL = os.environ.get('CSTRESS_BROKER', 'amqp://')
@@ -65,6 +72,9 @@ class default(object):
         'interval_max': 2,
         'interval_step': 0.1,
     }
+    CELERY_TASK_PROTOCOL = 2
+    if CSTRESS_TRANS:
+        CELERY_DEFAULT_DELIVERY_MODE = 1
 
 
 @template()
@@ -81,7 +91,7 @@ class redis(default):
 
 @template()
 class redistore(default):
-    CELERY_RESULT_BACKEND = 'redis://'
+    CELERY_RESULT_BACKEND = 'redis://?new_join=1'
 
 
 @template()
@@ -117,3 +127,16 @@ class events(default):
 @template()
 class execv(default):
     CELERYD_FORCE_EXECV = True
+
+
+@template()
+class sqs(default):
+    BROKER_URL = 'sqs://'
+    BROKER_TRANSPORT_OPTIONS = {
+        'region': os.environ.get('AWS_REGION', 'us-east-1'),
+    }
+
+
+@template()
+class proto1(default):
+    CELERY_TASK_PROTOCOL = 1

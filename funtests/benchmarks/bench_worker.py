@@ -1,23 +1,16 @@
-from __future__ import print_function
+from __future__ import print_function, unicode_literals
 
 import os
 import sys
-import time
 
 os.environ.update(
     NOSETPS='yes',
     USE_FAST_LOCALS='yes',
 )
 
-import anyjson
-JSONIMP = os.environ.get('JSONIMP')
-if JSONIMP:
-    anyjson.force_implementation(JSONIMP)
-
-print('anyjson implementation: {0!r}'.format(anyjson.implementation.name))
-
-from celery import Celery, group
+from celery import Celery
 from celery.five import range
+from kombu.five import monotonic
 
 DEFAULT_ITS = 40000
 
@@ -31,7 +24,6 @@ app.conf.update(
     BROKER_POOL_LIMIT=10,
     CELERYD_POOL='solo',
     CELERYD_PREFETCH_MULTIPLIER=0,
-    CELERY_DISABLE_RATE_LIMITS=True,
     CELERY_DEFAULT_DELIVERY_MODE=1,
     CELERY_QUEUES={
         'bench.worker': {
@@ -50,32 +42,36 @@ app.conf.update(
 
 
 def tdiff(then):
-    return time.time() - then
+    return monotonic() - then
 
 
 @app.task(cur=0, time_start=None, queue='bench.worker', bare=True)
 def it(_, n):
-    i = it.cur  # use internal counter, as ordering can be skewed
-                # by previous runs, or the broker.
+    # use internal counter, as ordering can be skewed
+    # by previous runs, or the broker.
+    i = it.cur
     if i and not i % 5000:
         print('({0} so far: {1}s)'.format(i, tdiff(it.subt)), file=sys.stderr)
-        it.subt = time.time()
+        it.subt = monotonic()
     if not i:
-        it.subt = it.time_start = time.time()
-    elif i == n - 1:
+        it.subt = it.time_start = monotonic()
+    elif i > n - 2:
         total = tdiff(it.time_start)
         print('({0} so far: {1}s)'.format(i, tdiff(it.subt)), file=sys.stderr)
         print('-- process {0} tasks: {1}s total, {2} tasks/s} '.format(
             n, total, n / (total + .0),
         ))
-        sys.exit()
+        import os
+        os._exit()
     it.cur += 1
 
 
 def bench_apply(n=DEFAULT_ITS):
-    time_start = time.time()
-    group(it.s(i, n) for i in range(n))()
-    print('-- apply {0} tasks: {1}s'.format(n, time.time() - time_start))
+    time_start = monotonic()
+    task = it._get_current_object()
+    with app.producer_or_acquire() as producer:
+        [task.apply_async((i, n), producer=producer) for i in range(n)]
+    print('-- apply {0} tasks: {1}s'.format(n, monotonic() - time_start))
 
 
 def bench_work(n=DEFAULT_ITS, loglevel='CRITICAL'):

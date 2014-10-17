@@ -98,12 +98,14 @@ class test_prepare_exception(AppCase):
         self.b = BaseBackend(self.app)
 
     def test_unpickleable(self):
+        self.b.serializer = 'pickle'
         x = self.b.prepare_exception(Unpickleable(1, 2, 'foo'))
         self.assertIsInstance(x, KeyError)
         y = self.b.exception_to_python(x)
         self.assertIsInstance(y, KeyError)
 
     def test_impossible(self):
+        self.b.serializer = 'pickle'
         x = self.b.prepare_exception(Impossible())
         self.assertIsInstance(x, UnpickleableExceptionWrapper)
         self.assertTrue(str(x))
@@ -115,6 +117,7 @@ class test_prepare_exception(AppCase):
             self.assertEqual(y.__class__.__module__, 'foo.module')
 
     def test_regular(self):
+        self.b.serializer = 'pickle'
         x = self.b.prepare_exception(KeyError('baz'))
         self.assertIsInstance(x, KeyError)
         y = self.b.exception_to_python(x)
@@ -184,6 +187,11 @@ class test_BaseBackend_dict(AppCase):
         b._save_group = Mock()
         b.save_group('foofoo', 'xxx')
         b._save_group.assert_called_with('foofoo', 'xxx')
+
+    def test_add_to_chord_interface(self):
+        b = BaseBackend(self.app)
+        with self.assertRaises(NotImplementedError):
+            b.add_to_chord('group_id', 'sig')
 
     def test_forget_interface(self):
         b = BaseBackend(self.app)

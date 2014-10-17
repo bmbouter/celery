@@ -55,10 +55,14 @@ must also export them (e.g. ``export DISPLAY=":0"``)
     .. code-block:: bash
 
         $ celery multi start worker1 \
+            -A proj \
             --pidfile="$HOME/run/celery/%n.pid" \
-            --logfile="$HOME/log/celery/%n.log"
+            --logfile="$HOME/log/celery/%n%I.log"
 
-        $ celery multi restart worker1 --pidfile="$HOME/run/celery/%n.pid"
+        $ celery multi restart worker1 \
+            -A proj \
+            --logfile="$HOME/log/celery/%n%I.log" \
+            --pidfile="$HOME/run/celery/%n.pid
 
         $ celery multi stopwait worker1 --pidfile="$HOME/run/celery/%n.pid"
 
@@ -74,11 +78,13 @@ This is an example configuration for a Python project.
 .. code-block:: bash
 
     # Names of nodes to start
-    #   most will only start one node:
+    #   most people will only start one node:
     CELERYD_NODES="worker1"
     #   but you can also start multiple and configure settings
-    #   for each in CELERYD_OPTS (see `celery multi --help` for examples).
-    CELERYD_NODES="worker1 worker2 worker3"
+    #   for each in CELERYD_OPTS (see `celery multi --help` for examples):
+    #CELERYD_NODES="worker1 worker2 worker3"
+    #   alternatively, you can specify the number of nodes to start:
+    #CELERYD_NODES=10
 
     # Absolute or relative path to the 'celery' command:
     CELERY_BIN="/usr/local/bin/celery"
@@ -96,8 +102,11 @@ This is an example configuration for a Python project.
     # Extra command-line arguments to the worker
     CELERYD_OPTS="--time-limit=300 --concurrency=8"
 
+    # Set logging level to DEBUG
+    #CELERYD_LOG_LEVEL="DEBUG"
+
     # %n will be replaced with the first part of the nodename.
-    CELERYD_LOG_FILE="/var/log/celery/%n.log"
+    CELERYD_LOG_FILE="/var/log/celery/%n%I.log"
     CELERYD_PID_FILE="/var/run/celery/%n.pid"
 
     # Workers should run as an unprivileged user.
@@ -156,7 +165,9 @@ Available options
     Full path to the PID file. Default is /var/run/celery/%n.pid
 
 * CELERYD_LOG_FILE
-    Full path to the worker log file. Default is /var/log/celery/%n.log
+    Full path to the worker log file. Default is /var/log/celery/%n%I.log
+    **Note**: Using `%I` is important when using the prefork pool as having
+    multiple processes share the same log file will lead to race conditions.
 
 * CELERYD_LOG_LEVEL
     Worker log level. Default is INFO.
@@ -211,7 +222,7 @@ This is an example configuration for a Python project:
     CELERYBEAT_CHDIR="/opt/Myproject/"
 
     # Extra arguments to celerybeat
-    CELERYBEAT_OPTS="--schedule=/var/run/celerybeat-schedule"
+    CELERYBEAT_OPTS="--schedule=/var/run/celery/celerybeat-schedule"
 
 .. _generic-initd-celerybeat-django-example:
 
@@ -265,7 +276,7 @@ Available options
 * CELERY_CREATE_LOGDIR
     Always create logfile directory.  By default only enable when no custom
     logfile location set.
-    
+
 .. _daemon-systemd-generic:
 
 Usage systemd
@@ -279,10 +290,10 @@ Service file: celery.service
 :Usage: `systemctl {start|stop|restart|status} celery.service`
 :Configuration file: /etc/conf.d/celery
 
-To create a temporary folders for the log and pid files change user and group in 
+To create a temporary folders for the log and pid files change user and group in
 /usr/lib/tmpfiles.d/celery.conf.
-To configure user, group, chdir change settings User, Group and WorkingDirectory defines 
-in /usr/lib/systemd/system/celery.service. 
+To configure user, group, chdir change settings User, Group and WorkingDirectory defines
+in /usr/lib/systemd/system/celery.service.
 
 .. _generic-systemd-celery-example:
 
@@ -311,8 +322,10 @@ This is an example configuration for a Python project:
     # Extra command-line arguments to the worker
     CELERYD_OPTS="--time-limit=300 --concurrency=8"
 
-    # %n will be replaced with the first part of the nodename.
-    CELERYD_LOG_FILE="/var/log/celery/%n.log"
+    # - %n will be replaced with the first part of the nodename.
+    # - %I will be replaced with the current child process index
+    #   and is important when using the prefork pool to avoid race conditions.
+    CELERYD_LOG_FILE="/var/log/celery/%n%I.log"
     CELERYD_PID_FILE="/var/run/celery/%n.pid"
 
 .. _generic-systemd-celeryd-django-example:
@@ -339,8 +352,9 @@ This is an example configuration for those using `django-celery`:
     # Extra command-line arguments to the worker
     CELERYD_OPTS="--time-limit=300 --concurrency=8"
 
-    # %n will be replaced with the first part of the nodename.
-    CELERYD_LOG_FILE="/var/log/celery/%n.log"
+    # - %n will be replaced with the first part of the nodename.
+    # - %I will be replaced with the current child process index
+    CELERYD_LOG_FILE="/var/log/celery/%n%I.log"
     CELERYD_PID_FILE="/var/run/celery/%n.pid"
 
 To add an environment variable such as DJANGO_SETTINGS_MODULE use the

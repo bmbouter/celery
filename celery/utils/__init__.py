@@ -19,7 +19,6 @@ import datetime
 
 from collections import Callable
 from functools import partial, wraps
-from inspect import getargspec
 from pprint import pprint
 
 from kombu.entity import Exchange, Queue
@@ -189,14 +188,6 @@ def is_iterable(obj):
     return True
 
 
-def fun_takes_kwargs(fun, kwlist=[]):
-    # deprecated
-    S = getattr(fun, 'argspec', getargspec(fun))
-    if S.keywords is not None:
-        return kwlist
-    return [kw for kw in kwlist if kw in S.args]
-
-
 def isatty(fh):
     try:
         return fh.isatty()
@@ -307,6 +298,7 @@ def jsonify(obj,
 
 def gen_task_name(app, name, module_name):
     """Generate task name from name/module pair."""
+    module_name = module_name or '__main__'
     try:
         module = sys.modules[module_name]
     except KeyError:
@@ -395,5 +387,5 @@ from .imports import (          # noqa
     instantiate, import_from_cwd
 )
 from .functional import chunks, noop                    # noqa
-from kombu.utils import cached_property, kwdict, uuid   # noqa
+from kombu.utils import cached_property, uuid   # noqa
 gen_unique_id = uuid

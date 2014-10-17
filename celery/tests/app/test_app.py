@@ -251,14 +251,14 @@ class test_App(AppCase):
             _state._task_stack.pop()
 
     def test_task_not_shared(self):
-        with patch('celery.app.base.shared_task') as sh:
+        with patch('celery.app.base.connect_on_app_finalize') as sh:
             @self.app.task(shared=False)
             def foo():
                 pass
             self.assertFalse(sh.called)
 
     def test_task_compat_with_filter(self):
-        with self.Celery(accept_magic_kwargs=True) as app:
+        with self.Celery() as app:
             check = Mock()
 
             def filter(task):
@@ -271,7 +271,7 @@ class test_App(AppCase):
             check.assert_called_with(foo)
 
     def test_task_with_filter(self):
-        with self.Celery(accept_magic_kwargs=False) as app:
+        with self.Celery() as app:
             check = Mock()
 
             def filter(task):
@@ -432,7 +432,8 @@ class test_App(AppCase):
                              {'foo': 'bar'})
 
     def test_compat_setting_CELERY_BACKEND(self):
-
+        self.app._preconf = {}
+        self.app.conf.defaults[0]['CELERY_RESULT_BACKEND'] = None
         self.app.config_from_object(Object(CELERY_BACKEND='set_by_us'))
         self.assertEqual(self.app.conf.CELERY_RESULT_BACKEND, 'set_by_us')
 

@@ -76,7 +76,7 @@ so I cannot recommend them for production use.
 The next version of Celery 3.2 will focus on performance and removing
 rarely used parts of the library.  Work has also started on a new message
 protocol, supporting multiple languages and more.  The initial draft can
-be found :ref:`here <protov2draft>`.
+be found :ref:`here <message-protocol-task-v2`.
 
 This has probably been the hardest release I've worked on, so no
 introduction to this changelog would be complete without a massive
@@ -706,10 +706,17 @@ In Other News
         >>> g()
         <GroupResult: e1094b1d-08fc-4e14-838e-6d601b99da6d [70c0fb3d-b60e-4b22-8df7-aa25b9abc86d, 58fcd260-2e32-4308-a2ea-f5be4a24f7f4]>
 
+- Chord exception behavior defined (Issue #1172).
+
+    From this version the chord callback will change state to FAILURE
+    when a task part of a chord raises an exception.
+
+    See more at :ref:`chord-errors`.
+
 -  New ability to specify additional command line options
    to the worker and beat programs.
 
-    The :attr:`@Celery.user_options` attribute can be used
+    The :attr:`@user_options` attribute can be used
     to add additional command-line arguments, and expects
     optparse-style options:
 
@@ -1046,7 +1053,7 @@ In Other News
     This is the mapping of parsed command line arguments, and can be used to
     prepare new preload arguments (``app.user_options['preload']``).
 
-- New callback: ``Celery.on_configure``.
+- New callback: :meth:`@on_configure`.
 
     This callback is called when an app is about to be configured (a
     configuration key is required).
@@ -1072,8 +1079,9 @@ In Other News
   (Issue #1555).
 
     The revoked signal is dispatched after the task request is removed from
-    the stack, so it must instead use the :class:`~celery.worker.job.Request`
-    object to get information about the task.
+    the stack, so it must instead use the
+    :class:`~celery.worker.request.Request` object to get information
+    about the task.
 
 - Worker: New :option:`-X` command line argument to exclude queues
   (Issue #1399).
@@ -1204,8 +1212,9 @@ Fixes
 - Eventlet/gevent/solo/threads pools now properly handles :exc:`BaseException`
   errors raised by tasks.
 
-- Autoscale and ``pool_grow``/``pool_shrink`` remote control commands
-  will now also automatically increase and decrease the consumer prefetch count.
+- :control:`autoscale` and :control:`pool_grow`/:control:`pool_shrink` remote
+  control commands will now also automatically increase and decrease the
+  consumer prefetch count.
 
     Fix contributed by Daniel M. Taub.
 
@@ -1235,7 +1244,7 @@ Internal changes
     - Result backends (:class:`celery.backends.base.BaseBackend`)
     - :class:`celery.worker.WorkController`
     - :class:`celery.worker.Consumer`
-    - :class:`celery.worker.job.Request`
+    - :class:`celery.worker.request.Request`
 
     This means that you have to pass a specific app when instantiating
     these classes.
@@ -1255,7 +1264,7 @@ Internal changes
     This removes a lot of duplicate functionality.
 
 - The ``Celery.with_default_connection`` method has been removed in favor
-  of ``with app.connection_or_acquire``.
+  of ``with app.connection_or_acquire`` (:meth:`@connection_or_acquire`)
 
 - The ``celery.results.BaseDictBackend`` class has been removed and is replaced by
   :class:`celery.results.BaseBackend`.

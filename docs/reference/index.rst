@@ -39,7 +39,6 @@
     celery.contrib.migrate
     celery.contrib.sphinx
     celery.contrib.rdb
-    celery.contrib.methods
     celery.events
     celery.events.state
     celery.beat
@@ -47,7 +46,7 @@
     celery.apps.beat
     celery.worker
     celery.worker.consumer
-    celery.worker.job
+    celery.worker.request
     celery.worker.state
     celery.worker.strategy
     celery.bin.base

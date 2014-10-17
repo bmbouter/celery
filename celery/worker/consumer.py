@@ -26,8 +26,8 @@ from billiard.common import restart_state
 from billiard.exceptions import RestartFreqExceeded
 from kombu.async.semaphore import DummyLock
 from kombu.common import QoS, ignore_errors
+from kombu.five import buffer_t, items, values
 from kombu.syn import _detect_environment
-from kombu.utils.compat import get_errno
 from kombu.utils.encoding import safe_repr, bytes_t
 from kombu.utils.limits import TokenBucket
 
@@ -35,7 +35,6 @@ from celery import bootsteps
 from celery.app.trace import build_tracer
 from celery.canvas import signature
 from celery.exceptions import InvalidTaskError
-from celery.five import items, values
 from celery.utils.functional import noop
 from celery.utils.log import get_logger
 from celery.utils.text import truncate
@@ -43,14 +42,6 @@ from celery.utils.timeutils import humanize_seconds, rate
 
 from . import heartbeat, loops, pidbox
 from .state import task_reserved, maybe_shutdown, revoked, reserved_requests
-
-try:
-    buffer_t = buffer
-except NameError:  # pragma: no cover
-    # Py3 does not have buffer, but we only need isinstance.
-
-    class buffer_t(object):  # noqa
-        pass
 
 __all__ = [
     'Consumer', 'Connection', 'Events', 'Heart', 'Control',
@@ -127,6 +118,8 @@ MINGLE_GET_FIELDS = itemgetter('clock', 'revoked')
 
 
 def dump_body(m, body):
+    # v2 protocol does not deserialize body
+    body = m.body if body is None else body
     if isinstance(body, buffer_t):
         body = bytes_t(body)
     return '{0} ({1}b)'.format(truncate(safe_repr(body), 1024),
@@ -189,6 +182,7 @@ class Consumer(object):
         self._restart_state = restart_state(maxR=5, maxT=1)
 
         self._does_info = logger.isEnabledFor(logging.INFO)
+        self._limit_order = 0
         self.on_task_request = on_task_request
         self.on_task_message = set()
         self.amqheartbeat_rate = self.app.conf.BROKER_HEARTBEAT_CHECKRATE
@@ -259,25 +253,31 @@ class Consumer(object):
                 else self.qos.increment_eventually)(
             abs(index) * self.prefetch_multiplier)
 
+    def _limit_move_to_pool(self, request):
+        task_reserved(request)
+        self.on_task_request(request)
+
     def _limit_task(self, request, bucket, tokens):
         if not bucket.can_consume(tokens):
             hold = bucket.expected_time(tokens)
+            pri = self._limit_order = (self._limit_order + 1) % 10
             self.timer.call_after(
-                hold, self._limit_task, (request, bucket, tokens),
+                hold, self._limit_move_to_pool, (request, ),
+                priority=pri,
             )
         else:
             task_reserved(request)
             self.on_task_request(request)
 
     def start(self):
-        blueprint, loop = self.blueprint, self.loop
+        blueprint = self.blueprint
         while blueprint.state != CLOSE:
             self.restart_count += 1
             maybe_shutdown()
             try:
                 blueprint.start(self)
             except self.connection_errors as exc:
-                if isinstance(exc, OSError) and get_errno(exc) == errno.EMFILE:
+                if isinstance(exc, OSError) and exc.errno == errno.EMFILE:
                     raise  # Too many open files
                 maybe_shutdown()
                 try:
@@ -378,6 +378,14 @@ class Consumer(object):
             conn.transport.register_with_event_loop(conn.connection, self.hub)
         return conn
 
+    def _flush_events(self):
+        if self.event_dispatcher:
+            self.event_dispatcher.flush()
+
+    def on_send_event_buffered(self):
+        if self.hub:
+            self.hub._ready.add(self._flush_events)
+
     def add_task_queue(self, queue, exchange=None, exchange_type=None,
                        routing_key=None, **options):
         cset = self.task_consumer
@@ -445,21 +453,38 @@ class Consumer(object):
         on_invalid_task = self.on_invalid_task
         callbacks = self.on_task_message
 
-        def on_task_received(body, message):
-            try:
-                name = body['task']
-            except (KeyError, TypeError):
-                return on_unknown_message(body, message)
+        def on_task_received(message):
 
+            # payload will only be set for v1 protocol, since v2
+            # will defer deserializing the message body to the pool.
+            payload = None
             try:
-                strategies[name](message, body,
-                                 message.ack_log_error,
-                                 message.reject_log_error,
-                                 callbacks)
+                type_ = message.headers['task']                # protocol v2
+            except TypeError:
+                return on_unknown_message(None, message)
+            except KeyError:
+                payload = message.payload
+                try:
+                    type_, payload = payload['task'], payload  # protocol v1
+                except (TypeError, KeyError):
+                    return on_unknown_message(payload, message)
+            try:
+                strategy = strategies[type_]
             except KeyError as exc:
-                on_unknown_task(body, message, exc)
-            except InvalidTaskError as exc:
-                on_invalid_task(body, message, exc)
+                return on_unknown_task(payload, message, exc)
+            else:
+                try:
+                    strategy(
+                        message, payload, message.ack_log_error,
+                        message.reject_log_error, callbacks,
+                    )
+                except InvalidTaskError as exc:
+                    return on_invalid_task(payload, message, exc)
+                except MemoryError:
+                    raise
+                except Exception as exc:
+                    # XXX handle as internal error?
+                    return on_invalid_task(payload, message, exc)
 
         return on_task_received
 
@@ -506,6 +531,8 @@ class Events(bootsteps.StartStopStep):
         dis = c.event_dispatcher = c.app.events.Dispatcher(
             c.connect(), hostname=c.hostname,
             enabled=self.send_events, groups=self.groups,
+            buffer_group=['task'] if c.hub else None,
+            on_send_buffered=c.on_send_event_buffered if c.hub else None,
         )
         if prev:
             dis.extend_buffer(prev)
@@ -534,12 +561,16 @@ class Events(bootsteps.StartStopStep):
 class Heart(bootsteps.StartStopStep):
     requires = (Events, )
 
-    def __init__(self, c, without_heartbeat=False, **kwargs):
+    def __init__(self, c, without_heartbeat=False, heartbeat_interval=None,
+                 **kwargs):
         self.enabled = not without_heartbeat
+        self.heartbeat_interval = heartbeat_interval
         c.heart = None
 
     def start(self, c):
-        c.heart = heartbeat.Heart(c.timer, c.event_dispatcher)
+        c.heart = heartbeat.Heart(
+            c.timer, c.event_dispatcher, self.heartbeat_interval,
+        )
         c.heart.start()
 
     def stop(self, c):
@@ -589,11 +620,27 @@ class Tasks(bootsteps.StartStopStep):
 
     def start(self, c):
         c.update_strategies()
+
+        # - RabbitMQ 3.3 completely redefines how basic_qos works..
+        # This will detect if the new qos smenatics is in effect,
+        # and if so make sure the 'apply_global' flag is set on qos updates.
+        qos_global = not c.connection.qos_semantics_matches_spec
+
+        # set initial prefetch count
+        c.connection.default_channel.basic_qos(
+            0, c.initial_prefetch_count, qos_global,
+        )
+
         c.task_consumer = c.app.amqp.TaskConsumer(
             c.connection, on_decode_error=c.on_decode_error,
         )
-        c.qos = QoS(c.task_consumer.qos, c.initial_prefetch_count)
-        c.qos.update()  # set initial prefetch count
+
+        def set_prefetch_count(prefetch_count):
+            return c.task_consumer.qos(
+                prefetch_count=prefetch_count,
+                apply_global=qos_global,
+            )
+        c.qos = QoS(set_prefetch_count, c.initial_prefetch_count)
 
     def stop(self, c):
         if c.task_consumer:
@@ -645,7 +692,8 @@ class Gossip(bootsteps.ConsumerStep):
     )
     compatible_transports = {'amqp', 'redis'}
 
-    def __init__(self, c, without_gossip=False, interval=5.0, **kwargs):
+    def __init__(self, c, without_gossip=False,
+                 interval=5.0, heartbeat_interval=2.0, **kwargs):
         self.enabled = not without_gossip and self.compatible_transport(c.app)
         self.app = c.app
         c.gossip = self
@@ -664,6 +712,7 @@ class Gossip(bootsteps.ConsumerStep):
                 c._mutex = DummyLock()
             self.update_state = self.state.event
         self.interval = interval
+        self.heartbeat_interval = heartbeat_interval
         self._tref = None
         self.consensus_requests = defaultdict(list)
         self.consensus_replies = {}
@@ -762,7 +811,8 @@ class Gossip(bootsteps.ConsumerStep):
 
     def get_consumers(self, channel):
         self.register_timer()
-        ev = self.Receiver(channel, routing_key='worker.#')
+        ev = self.Receiver(channel, routing_key='worker.#',
+                           queue_ttl=self.heartbeat_interval)
         return [kombu.Consumer(
             channel,
             queues=[ev.queue],
@@ -787,7 +837,7 @@ class Gossip(bootsteps.ConsumerStep):
                     message.payload['hostname'])
         if hostname != self.hostname:
             type, event = prepare(message.payload)
-            obj, subject = self.update_state(event)
+            self.update_state(event)
         else:
             self.clock.forward()
 

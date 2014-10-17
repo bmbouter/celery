@@ -11,12 +11,12 @@ from __future__ import absolute_import
 import sys
 import threading
 
+from collections import OrderedDict
 from functools import wraps
 from itertools import islice
 
 from kombu.utils import cached_property
 from kombu.utils.functional import lazy, maybe_evaluate, is_list, maybe_list
-from kombu.utils.compat import OrderedDict
 
 from celery.five import UserDict, UserList, items, keys
 
@@ -239,7 +239,6 @@ def chunks(it, n):
         [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10]]
 
     """
-    # XXX This function is not used anymore, at least not by Celery itself.
     for first in it:
         yield [first] + list(islice(it, n - 1))
 

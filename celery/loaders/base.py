@@ -8,7 +8,6 @@
 """
 from __future__ import absolute_import
 
-import anyjson
 import imp as _imp
 import importlib
 import os
@@ -17,6 +16,7 @@ import sys
 
 from datetime import datetime
 
+from kombu.utils import json
 from kombu.utils import cached_property
 from kombu.utils.encoding import safe_str
 
@@ -178,7 +178,7 @@ class BaseLoader(object):
     def cmdline_config_parser(
             self, args, namespace='celery',
             re_type=re.compile(r'\((\w+)\)'),
-            extra_types={'json': anyjson.loads},
+            extra_types={'json': json.loads},
             override_types={'tuple': 'json',
                             'list': 'json',
                             'dict': 'json'}):
@@ -190,12 +190,12 @@ class BaseLoader(object):
             """Parse a single configuration definition from
             the command-line."""
 
-            ## find key/value
+            # ## find key/value
             # ns.key=value|ns_key=value (case insensitive)
             key, value = arg.split('=', 1)
             key = key.upper().replace('.', '_')
 
-            ## find namespace.
+            # ## find namespace.
             # .key=value|_key=value expands to default namespace.
             if key[0] == '_':
                 ns, key = namespace, key[1:]
@@ -277,6 +277,13 @@ def autodiscover_tasks(packages, related_name='tasks'):
 def find_related_module(package, related_name):
     """Given a package name and a module name, tries to find that
     module."""
+
+    # Django 1.7 allows for speciying a class name in INSTALLED_APPS.
+    # (Issue #2248).
+    try:
+        importlib.import_module(package)
+    except ImportError:
+        package, _, _ = package.rpartition('.')
 
     try:
         pkg_path = importlib.import_module(package).__path__

@@ -83,10 +83,13 @@ class test_Consumer(AppCase):
         with patch('celery.worker.consumer.task_reserved') as reserved:
             bucket.can_consume.return_value = False
             bucket.expected_time.return_value = 3.33
+            limit_order = c._limit_order
             c._limit_task(request, bucket, 4)
+            self.assertEqual(c._limit_order, limit_order + 1)
             bucket.can_consume.assert_called_with(4)
             c.timer.call_after.assert_called_with(
-                3.33, c._limit_task, (request, bucket, 4),
+                3.33, c._limit_move_to_pool, (request, ),
+                priority=c._limit_order,
             )
             bucket.expected_time.assert_called_with(4)
             self.assertFalse(reserved.called)
@@ -164,11 +167,30 @@ class test_Heart(AppCase):
         with patch('celery.worker.heartbeat.Heart') as hcls:
             h = Heart(c)
             self.assertTrue(h.enabled)
+            self.assertEqual(h.heartbeat_interval, None)
             self.assertIsNone(c.heart)
 
             h.start(c)
             self.assertTrue(c.heart)
-            hcls.assert_called_with(c.timer, c.event_dispatcher)
+            hcls.assert_called_with(c.timer, c.event_dispatcher,
+                                    h.heartbeat_interval)
+            c.heart.start.assert_called_with()
+
+    def test_start_heartbeat_interval(self):
+        c = Mock()
+        c.timer = Mock()
+        c.event_dispatcher = Mock()
+
+        with patch('celery.worker.heartbeat.Heart') as hcls:
+            h = Heart(c, False, 20)
+            self.assertTrue(h.enabled)
+            self.assertEqual(h.heartbeat_interval, 20)
+            self.assertIsNone(c.heart)
+
+            h.start(c)
+            self.assertTrue(c.heart)
+            hcls.assert_called_with(c.timer, c.event_dispatcher,
+                                    h.heartbeat_interval)
             c.heart.start.assert_called_with()
 
 

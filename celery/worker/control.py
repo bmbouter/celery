@@ -14,7 +14,7 @@ import tempfile
 from kombu.utils.encoding import safe_repr
 
 from celery.exceptions import WorkerShutdown
-from celery.five import UserDict, items
+from celery.five import UserDict, items, string_t
 from celery.platforms import signals as _signals
 from celery.utils import timeutils
 from celery.utils.functional import maybe_list
@@ -22,8 +22,8 @@ from celery.utils.log import get_logger
 from celery.utils import jsonify
 
 from . import state as worker_state
+from .request import Request
 from .state import revoked
-from .job import Request
 
 __all__ = ['Panel']
 DEFAULT_TASK_INFO_ITEMS = ('exchange', 'routing_key', 'rate_limit')
@@ -110,7 +110,7 @@ def report(state):
 @Panel.register
 def enable_events(state):
     dispatcher = state.consumer.event_dispatcher
-    if 'task' not in dispatcher.groups:
+    if dispatcher.groups and 'task' not in dispatcher.groups:
         dispatcher.groups.add('task')
         logger.info('Events of group {task} enabled by remote.')
         return {'ok': 'task events enabled'}
@@ -227,7 +227,7 @@ def objgraph(state, num=200, max_depth=10, type='Request'):  # pragma: no cover
         import objgraph
     except ImportError:
         raise ImportError('Requires the objgraph library')
-    print('Dumping graph for type %r' % (type, ))
+    logger.info('Dumping graph for type %r', type)
     with tempfile.NamedTemporaryFile(prefix='cobjg',
                                      suffix='.png', delete=False) as fh:
         objects = objgraph.by_type(type)[:num]
@@ -274,9 +274,12 @@ def hello(state, from_node, revoked=None, **kwargs):
 
 
 @Panel.register
-def dump_tasks(state, taskinfoitems=None, **kwargs):
-    tasks = state.app.tasks
+def dump_tasks(state, taskinfoitems=None, builtins=False, **kwargs):
+    reg = state.app.tasks
     taskinfoitems = taskinfoitems or DEFAULT_TASK_INFO_ITEMS
+
+    tasks = reg if builtins else (
+        task for task in reg if not task.startswith('celery.'))
 
     def _extract_info(task):
         fields = {
@@ -288,7 +291,7 @@ def dump_tasks(state, taskinfoitems=None, **kwargs):
             return '{0} [{1}]'.format(task.name, ' '.join(info))
         return task.name
 
-    return [_extract_info(tasks[task]) for task in sorted(tasks)]
+    return [_extract_info(reg[task]) for task in sorted(tasks)]
 
 
 @Panel.register
@@ -364,7 +367,9 @@ def active_queues(state):
 
 
 def _wanted_config_key(key):
-    return key.isupper() and not key.startswith('__')
+    return (isinstance(key, string_t) and
+            key.isupper() and
+            not key.startswith('__'))
 
 
 @Panel.register

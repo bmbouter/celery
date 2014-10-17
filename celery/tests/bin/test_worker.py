@@ -17,7 +17,7 @@ from celery.bin.worker import worker, main as worker_main
 from celery.exceptions import (
     ImproperlyConfigured, WorkerShutdown, WorkerTerminate,
 )
-from celery.utils.log import ensure_process_aware_logger
+from celery.platforms import EX_FAILURE, EX_OK
 from celery.worker import state
 
 from celery.tests.case import (
@@ -29,8 +29,6 @@ from celery.tests.case import (
     skip_if_pypy,
     skip_if_jython,
 )
-
-ensure_process_aware_logger()
 
 
 class WorkerAppCase(AppCase):
@@ -206,7 +204,10 @@ class test_Worker(WorkerAppCase):
         # test when there are too few output lines
         # to draft the ascii art onto
         prev, cd.ARTLINES = cd.ARTLINES, ['the quick brown fox']
-        self.assertTrue(worker.startup_info())
+        try:
+            self.assertTrue(worker.startup_info())
+        finally:
+            cd.ARTLINES = prev
 
     @disable_stdouts
     def test_run(self):
@@ -322,8 +323,11 @@ class test_Worker(WorkerAppCase):
             app=self.app, redirect_stdouts=False, no_color=True,
         )
         prev, self.app.log.setup = self.app.log.setup, Mock()
-        worker.setup_logging()
-        self.assertFalse(self.app.log.setup.call_args[1]['colorize'])
+        try:
+            worker.setup_logging()
+            self.assertFalse(self.app.log.setup.call_args[1]['colorize'])
+        finally:
+            self.app.log.setup = prev
 
     @disable_stdouts
     def test_startup_info_pool_is_str(self):
@@ -443,8 +447,10 @@ class test_funs(WorkerAppCase):
     def test_parse_options(self):
         cmd = worker()
         cmd.app = self.app
-        opts, args = cmd.parse_options('worker', ['--concurrency=512'])
+        opts, args = cmd.parse_options('worker', ['--concurrency=512',
+                                       '--heartbeat-interval=10'])
         self.assertEqual(opts.concurrency, 512)
+        self.assertEqual(opts.heartbeat_interval, 10)
 
     @disable_stdouts
     def test_main(self):
@@ -488,8 +494,8 @@ class test_signal_handlers(WorkerAppCase):
         worker = self._Worker()
         handlers = self.psig(cd.install_worker_int_handler, worker)
         next_handlers = {}
-        state.should_stop = False
-        state.should_terminate = False
+        state.should_stop = None
+        state.should_terminate = None
 
         class Signals(platforms.Signals):
 
@@ -502,15 +508,17 @@ class test_signal_handlers(WorkerAppCase):
             try:
                 handlers['SIGINT']('SIGINT', object())
                 self.assertTrue(state.should_stop)
+                self.assertEqual(state.should_stop, EX_FAILURE)
             finally:
                 platforms.signals = p
-                state.should_stop = False
+                state.should_stop = None
 
             try:
                 next_handlers['SIGINT']('SIGINT', object())
                 self.assertTrue(state.should_terminate)
+                self.assertEqual(state.should_terminate, EX_FAILURE)
             finally:
-                state.should_terminate = False
+                state.should_terminate = None
 
         with patch('celery.apps.worker.active_thread_count') as c:
             c.return_value = 1
@@ -541,7 +549,7 @@ class test_signal_handlers(WorkerAppCase):
                 self.assertTrue(state.should_stop)
             finally:
                 process.name = name
-                state.should_stop = False
+                state.should_stop = None
 
         with patch('celery.apps.worker.active_thread_count') as c:
             c.return_value = 1
@@ -552,7 +560,7 @@ class test_signal_handlers(WorkerAppCase):
                     handlers['SIGINT']('SIGINT', object())
             finally:
                 process.name = name
-                state.should_stop = False
+                state.should_stop = None
 
     @disable_stdouts
     def test_install_HUP_not_supported_handler(self):
@@ -578,14 +586,17 @@ class test_signal_handlers(WorkerAppCase):
                     handlers['SIGQUIT']('SIGQUIT', object())
                     self.assertTrue(state.should_terminate)
                 finally:
-                    state.should_terminate = False
+                    state.should_terminate = None
             with patch('celery.apps.worker.active_thread_count') as c:
                 c.return_value = 1
                 worker = self._Worker()
                 handlers = self.psig(
                     cd.install_worker_term_hard_handler, worker)
-                with self.assertRaises(WorkerTerminate):
-                    handlers['SIGQUIT']('SIGQUIT', object())
+                try:
+                    with self.assertRaises(WorkerTerminate):
+                        handlers['SIGQUIT']('SIGQUIT', object())
+                finally:
+                    state.should_terminate = None
         finally:
             process.name = name
 
@@ -597,9 +608,9 @@ class test_signal_handlers(WorkerAppCase):
             handlers = self.psig(cd.install_worker_term_handler, worker)
             try:
                 handlers['SIGTERM']('SIGTERM', object())
-                self.assertTrue(state.should_stop)
+                self.assertEqual(state.should_stop, EX_OK)
             finally:
-                state.should_stop = False
+                state.should_stop = None
 
     @disable_stdouts
     def test_worker_term_handler_when_single_thread(self):
@@ -611,7 +622,7 @@ class test_signal_handlers(WorkerAppCase):
                 with self.assertRaises(WorkerShutdown):
                     handlers['SIGTERM']('SIGTERM', object())
             finally:
-                state.should_stop = False
+                state.should_stop = None
 
     @patch('sys.__stderr__')
     @skip_if_pypy
@@ -635,7 +646,7 @@ class test_signal_handlers(WorkerAppCase):
                 worker = self._Worker()
                 handlers = self.psig(cd.install_worker_term_handler, worker)
                 handlers['SIGTERM']('SIGTERM', object())
-                self.assertTrue(state.should_stop)
+                self.assertEqual(state.should_stop, EX_OK)
             with patch('celery.apps.worker.active_thread_count') as c:
                 c.return_value = 1
                 worker = self._Worker()
@@ -644,7 +655,7 @@ class test_signal_handlers(WorkerAppCase):
                     handlers['SIGTERM']('SIGTERM', object())
         finally:
             process.name = name
-            state.should_stop = False
+            state.should_stop = None
 
     @disable_stdouts
     @patch('celery.platforms.close_open_fds')
@@ -663,14 +674,14 @@ class test_signal_handlers(WorkerAppCase):
             worker = self._Worker()
             handlers = self.psig(cd.install_worker_restart_handler, worker)
             handlers['SIGHUP']('SIGHUP', object())
-            self.assertTrue(state.should_stop)
+            self.assertEqual(state.should_stop, EX_OK)
             self.assertTrue(register.called)
             callback = register.call_args[0][0]
             callback()
             self.assertTrue(argv)
         finally:
             os.execv = execv
-            state.should_stop = False
+            state.should_stop = None
 
     @disable_stdouts
     def test_worker_term_hard_handler_when_threaded(self):
@@ -682,7 +693,7 @@ class test_signal_handlers(WorkerAppCase):
                 handlers['SIGQUIT']('SIGQUIT', object())
                 self.assertTrue(state.should_terminate)
             finally:
-                state.should_terminate = False
+                state.should_terminate = None
 
     @disable_stdouts
     def test_worker_term_hard_handler_when_single_threaded(self):

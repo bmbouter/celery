@@ -13,7 +13,6 @@ import threading
 import warnings
 
 from collections import defaultdict, deque
-from contextlib import contextmanager
 from copy import deepcopy
 from operator import attrgetter
 
@@ -27,30 +26,35 @@ from celery import platforms
 from celery import signals
 from celery._state import (
     _task_stack, get_current_app, _set_current_app, set_default_app,
-    _register_app, get_current_worker_task,
+    _register_app, get_current_worker_task, connect_on_app_finalize,
+    _announce_app_finalized,
 )
 from celery.exceptions import AlwaysEagerIgnored, ImproperlyConfigured
-from celery.five import items, values
+from celery.five import values
 from celery.loaders import get_loader_cls
 from celery.local import PromiseProxy, maybe_evaluate
+from celery.utils import gen_task_name
+from celery.utils.dispatch import Signal
 from celery.utils.functional import first, maybe_list
 from celery.utils.imports import instantiate, symbol_by_name
-from celery.utils.objects import mro_lookup
+from celery.utils.objects import FallbackContext, mro_lookup
 
 from .annotations import prepare as prepare_annotations
-from .builtins import shared_task, load_shared_tasks
 from .defaults import DEFAULTS, find_deprecated_settings
 from .registry import TaskRegistry
 from .utils import (
     AppPickler, Settings, bugreport, _unpickle_app, _unpickle_app_v2, appstr,
 )
 
+# Load all builtin tasks
+from . import builtins  # noqa
+
 __all__ = ['Celery']
 
 _EXECV = os.environ.get('FORKED_BY_MULTIPROCESSING')
-BUILTIN_FIXUPS = frozenset([
+BUILTIN_FIXUPS = {
     'celery.fixups.django:fixup',
-])
+}
 
 ERR_ENVVAR_NOT_SET = """\
 The environment variable {0!r} is not set,
@@ -72,7 +76,7 @@ def _unpickle_appattr(reverse_name, args):
     return get_current_app()._rgetattr(reverse_name)(*args)
 
 
-def _global_after_fork():
+def _global_after_fork(obj):
     # Previously every app would call:
     #    `register_after_fork(app, app._after_fork)`
     # but this created a leak as `register_after_fork` stores concrete object
@@ -81,12 +85,14 @@ def _global_after_fork():
     #
     # See Issue #1949
     from celery import _state
-    from multiprocessing.util import info
-    for app in _state.apps:
+    from multiprocessing import util as mputil
+    for app in _state._apps:
         try:
-            app._after_fork()
+            app._after_fork(obj)
         except Exception as exc:
-            info('after forker raised exception: %r' % (exc, ), exc_info=1)
+            if mputil._logger:
+                mputil._logger.info(
+                    'after forker raised exception: %r', exc, exc_info=1)
 
 
 def _ensure_after_fork():
@@ -114,16 +120,26 @@ class Celery(object):
     _pool = None
     builtin_fixups = BUILTIN_FIXUPS
 
+    #: Signal sent when app is loading configuration.
+    on_configure = None
+
+    #: Signal sent after app has prepared the configuration.
+    on_after_configure = None
+
+    #: Signal sent after app has been finalized.
+    on_after_finalize = None
+
+    #: ignored
+    accept_magic_kwargs = False
+
     def __init__(self, main=None, loader=None, backend=None,
                  amqp=None, events=None, log=None, control=None,
-                 set_as_current=True, accept_magic_kwargs=False,
-                 tasks=None, broker=None, include=None, changes=None,
-                 config_source=None, fixups=None, task_cls=None,
+                 set_as_current=True, tasks=None, broker=None, include=None,
+                 changes=None, config_source=None, fixups=None, task_cls=None,
                  autofinalize=True, **kwargs):
         self.clock = LamportClock()
         self.main = main
         self.amqp_cls = amqp or self.amqp_cls
-        self.backend_cls = backend or self.backend_cls
         self.events_cls = events or self.events_cls
         self.loader_cls = loader or self.loader_cls
         self.log_cls = log or self.log_cls
@@ -131,7 +147,6 @@ class Celery(object):
         self.task_cls = task_cls or self.task_cls
         self.set_as_current = set_as_current
         self.registry_cls = symbol_by_name(self.registry_cls)
-        self.accept_magic_kwargs = accept_magic_kwargs
         self.user_options = defaultdict(set)
         self.steps = defaultdict(set)
         self.autofinalize = autofinalize
@@ -157,6 +172,8 @@ class Celery(object):
         self._preconf = changes or {}
         if broker:
             self._preconf['BROKER_URL'] = broker
+        if backend:
+            self._preconf['CELERY_RESULT_BACKEND'] = backend
         if include:
             self._preconf['CELERY_IMPORTS'] = include
 
@@ -167,6 +184,13 @@ class Celery(object):
 
         if self.set_as_current:
             self.set_current()
+
+        # Signals
+        if self.on_configure is None:
+            # used to be a method pre 3.2
+            self.on_configure = Signal()
+        self.on_after_configure = Signal()
+        self.on_after_finalize = Signal()
 
         self.on_init()
         _register_app(self)
@@ -202,30 +226,24 @@ class Celery(object):
 
     def task(self, *args, **opts):
         """Creates new task class from any callable."""
-        if _EXECV and not opts.get('_force_evaluate'):
+        if _EXECV and opts.get('lazy', True):
             # When using execv the task in the original module will point to a
             # different app, so doing things like 'add.request' will point to
-            # a differnt task instance.  This makes sure it will always use
+            # a different task instance.  This makes sure it will always use
             # the task instance from the current app.
             # Really need a better solution for this :(
-            from . import shared_task as proxies_to_curapp
-            return proxies_to_curapp(*args, _force_evaluate=True, **opts)
+            from . import shared_task
+            return shared_task(*args, lazy=False, **opts)
 
-        def inner_create_task_cls(shared=True, filter=None, **opts):
+        def inner_create_task_cls(shared=True, filter=None, lazy=True, **opts):
             _filt = filter  # stupid 2to3
 
             def _create_task_cls(fun):
                 if shared:
                     cons = lambda app: app._task_from_fun(fun, **opts)
                     cons.__name__ = fun.__name__
-                    shared_task(cons)
-                if self.accept_magic_kwargs:  # compat mode
-                    task = self._task_from_fun(fun, **opts)
-                    if filter:
-                        task = filter(task)
-                    return task
-
-                if self.finalized or opts.get('_force_evaluate'):
+                    connect_on_app_finalize(cons)
+                if not lazy or self.finalized:
                     ret = self._task_from_fun(fun, **opts)
                 else:
                     # return a proxy object that evaluates on first use
@@ -248,22 +266,29 @@ class Celery(object):
                     sum([len(args), len(opts)])))
         return inner_create_task_cls(**opts)
 
-    def _task_from_fun(self, fun, **options):
+    def _task_from_fun(self, fun, name=None, base=None, bind=False, **options):
         if not self.finalized and not self.autofinalize:
             raise RuntimeError('Contract breach: app not finalized')
-        base = options.pop('base', None) or self.Task
-        bind = options.pop('bind', False)
+        name = name or self.gen_task_name(fun.__name__, fun.__module__)
+        base = base or self.Task
 
-        T = type(fun.__name__, (base, ), dict({
-            'app': self,
-            'accept_magic_kwargs': False,
-            'run': fun if bind else staticmethod(fun),
-            '_decorated': True,
-            '__doc__': fun.__doc__,
-            '__module__': fun.__module__,
-            '__wrapped__': fun}, **options))()
-        task = self._tasks[T.name]  # return global instance.
+        if name not in self._tasks:
+            task = type(fun.__name__, (base, ), dict({
+                'app': self,
+                'name': name,
+                'run': fun if bind else staticmethod(fun),
+                '_decorated': True,
+                '__doc__': fun.__doc__,
+                '__module__': fun.__module__,
+                '__wrapped__': fun}, **options))()
+            self._tasks[task.name] = task
+            task.bind(self)  # connects task to this app
+        else:
+            task = self._tasks[name]
         return task
+
+    def gen_task_name(self, name, module):
+        return gen_task_name(self, name, module)
 
     def finalize(self, auto=False):
         with self._finalize_mutex:
@@ -271,7 +296,7 @@ class Celery(object):
                 if auto and not self.autofinalize:
                     raise RuntimeError('Contract breach: app not finalized')
                 self.finalized = True
-                load_shared_tasks(self)
+                _announce_app_finalized(self)
 
                 pending = self._pending
                 while pending:
@@ -279,6 +304,8 @@ class Celery(object):
 
                 for task in values(self._tasks):
                     task.bind(self)
+
+                self.on_after_finalize.send(sender=self)
 
     def add_defaults(self, fun):
         if not callable(fun):
@@ -329,7 +356,7 @@ class Celery(object):
                   publisher=None, link=None, link_error=None,
                   add_to_parent=True, group_id=None, retries=0, chord=None,
                   reply_to=None, time_limit=None, soft_time_limit=None,
-                  **options):
+                  root_id=None, parent_id=None, route_name=None, **options):
         amqp = self.amqp
         task_id = task_id or uuid()
         producer = producer or publisher  # XXX compat
@@ -339,14 +366,14 @@ class Celery(object):
             warnings.warn(AlwaysEagerIgnored(
                 'CELERY_ALWAYS_EAGER has no effect on send_task',
             ), stacklevel=2)
-        options = router.route(options, name, args, kwargs)
+        options = router.route(options, route_name or name, args, kwargs)
 
         message = amqp.create_task_message(
             task_id, name, args, kwargs, countdown, eta, group_id,
             expires, retries, chord,
             maybe_list(link), maybe_list(link_error),
             reply_to or self.oid, time_limit, soft_time_limit,
-            self.conf.CELERY_SEND_TASK_SENT_EVENT,
+            self.conf.CELERY_SEND_TASK_SENT_EVENT, root_id, parent_id,
         )
 
         if connection:
@@ -389,27 +416,20 @@ class Celery(object):
         )
     broker_connection = connection
 
-    @contextmanager
-    def connection_or_acquire(self, connection=None, pool=True,
-                              *args, **kwargs):
-        if connection:
-            yield connection
-        else:
-            if pool:
-                with self.pool.acquire(block=True) as connection:
-                    yield connection
-            else:
-                with self.connection() as connection:
-                    yield connection
+    def _acquire_connection(self, pool=True):
+        """Helper for :meth:`connection_or_acquire`."""
+        if pool:
+            return self.pool.acquire(block=True)
+        return self.connection()
+
+    def connection_or_acquire(self, connection=None, pool=True, *_, **__):
+        return FallbackContext(connection, self._acquire_connection, pool=pool)
     default_connection = connection_or_acquire  # XXX compat
 
-    @contextmanager
     def producer_or_acquire(self, producer=None):
-        if producer:
-            yield producer
-        else:
-            with self.amqp.producer_pool.acquire(block=True) as producer:
-                yield producer
+        return FallbackContext(
+            producer, self.amqp.producer_pool.acquire, block=True,
+        )
     default_producer = producer_or_acquire  # XXX compat
 
     def prepare_config(self, c):
@@ -452,25 +472,23 @@ class Celery(object):
             self.loader)
         return backend(app=self, url=url)
 
-    def on_configure(self):
-        """Callback calld when the app loads configuration"""
-        pass
-
     def _get_config(self):
-        self.on_configure()
+        if isinstance(self.on_configure, Signal):
+            self.on_configure.send(sender=self)
+        else:
+            # used to be a method pre 3.2
+            self.on_configure()
         if self._config_source:
             self.loader.config_from_object(self._config_source)
+        defaults = dict(deepcopy(DEFAULTS), **self._preconf)
         self.configured = True
         s = Settings({}, [self.prepare_config(self.loader.conf),
-                          deepcopy(DEFAULTS)])
-
+                          defaults])
         # load lazy config dict initializers.
         pending = self._pending_defaults
         while pending:
             s.add_defaults(maybe_evaluate(pending.popleft()()))
-        if self._preconf:
-            for key, value in items(self._preconf):
-                setattr(s, key, value)
+        self.on_after_configure.send(sender=self, source=s)
         return s
 
     def _after_fork(self, obj_):
@@ -557,7 +575,6 @@ class Celery(object):
             'events': self.events_cls,
             'log': self.log_cls,
             'control': self.control_cls,
-            'accept_magic_kwargs': self.accept_magic_kwargs,
             'fixups': self.fixups,
             'config_source': self._config_source,
             'task_cls': self.task_cls,
@@ -568,7 +585,7 @@ class Celery(object):
         return (self.main, self.conf.changes,
                 self.loader_cls, self.backend_cls, self.amqp_cls,
                 self.events_cls, self.log_cls, self.control_cls,
-                self.accept_magic_kwargs, self._config_source)
+                False, self._config_source)
 
     @cached_property
     def Worker(self):

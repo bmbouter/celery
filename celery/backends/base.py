@@ -33,7 +33,6 @@ from celery.five import items
 from celery.result import (
     GroupResult, ResultBase, allow_join_result, result_from_tuple,
 )
-from celery.utils import timeutils
 from celery.utils.functional import LRUCache
 from celery.utils.log import get_logger
 from celery.utils.serialization import (
@@ -44,7 +43,7 @@ from celery.utils.serialization import (
 
 __all__ = ['BaseBackend', 'KeyValueStoreBackend', 'DisabledBackend']
 
-EXCEPTION_ABLE_CODECS = frozenset(['pickle', 'yaml'])
+EXCEPTION_ABLE_CODECS = frozenset({'pickle'})
 PY3 = sys.version_info >= (3, 0)
 
 logger = get_logger(__name__)
@@ -165,10 +164,12 @@ class BaseBackend(object):
 
     def exception_to_python(self, exc):
         """Convert serialized exception to Python exception."""
+        if not isinstance(exc, BaseException):
+            exc = create_exception_cls(
+                from_utf8(exc['exc_type']), __name__)(exc['exc_message'])
         if self.serializer in EXCEPTION_ABLE_CODECS:
-            return get_pickled_exception(exc)
-        return create_exception_cls(
-            from_utf8(exc['exc_type']), __name__)(exc['exc_message'])
+            exc = get_pickled_exception(exc)
+        return exc
 
     def prepare_value(self, result):
         """Prepare value for storage."""
@@ -188,8 +189,7 @@ class BaseBackend(object):
                      accept=self.accept)
 
     def wait_for(self, task_id,
-                 timeout=None, propagate=True, interval=0.5, no_ack=True,
-                 on_interval=None):
+                 timeout=None, interval=0.5, no_ack=True, on_interval=None):
         """Wait for task and return its result.
 
         If the task raises an exception, this exception
@@ -204,14 +204,9 @@ class BaseBackend(object):
         time_elapsed = 0.0
 
         while 1:
-            status = self.get_status(task_id)
-            if status == states.SUCCESS:
-                return self.get_result(task_id)
-            elif status in states.PROPAGATE_STATES:
-                result = self.get_result(task_id)
-                if propagate:
-                    raise result
-                return result
+            meta = self.get_task_meta(task_id)
+            if meta['status'] in states.READY_STATES:
+                return meta
             if on_interval:
                 on_interval()
             # avoid hammering the CPU checking status.
@@ -224,7 +219,7 @@ class BaseBackend(object):
         if value is None:
             value = self.app.conf.CELERY_TASK_RESULT_EXPIRES
         if isinstance(value, timedelta):
-            value = timeutils.timedelta_seconds(value)
+            value = value.total_seconds()
         if value is not None and type:
             return type(value)
         return value
@@ -340,6 +335,9 @@ class BaseBackend(object):
     def on_task_call(self, producer, task_id):
         return {}
 
+    def add_to_chord(self, chord_id, result):
+        raise NotImplementedError('Backend does not support add_to_chord')
+
     def on_chord_part_return(self, task, state, result, propagate=False):
         pass
 
@@ -350,9 +348,11 @@ class BaseBackend(object):
             (group_id, body, ), kwargs, countdown=countdown,
         )
 
-    def apply_chord(self, header, partial_args, group_id, body, **options):
-        result = header(*partial_args, task_id=group_id)
-        self.fallback_chord_unlock(group_id, body, **options)
+    def apply_chord(self, header, partial_args, group_id, body,
+                    options={}, **kwargs):
+        options['task_id'] = group_id
+        result = header(*partial_args, **options or {})
+        self.fallback_chord_unlock(group_id, body, **kwargs)
         return result
 
     def current_task_children(self, request=None):
@@ -515,9 +515,9 @@ class KeyValueStoreBackend(BaseBackend):
             return meta
 
     def _apply_chord_incr(self, header, partial_args, group_id, body,
-                          result=None, **options):
+                          result=None, options={}, **kwargs):
         self.save_group(group_id, self.app.GroupResult(group_id, result))
-        return header(*partial_args, task_id=group_id)
+        return header(*partial_args, task_id=group_id, **options or {})
 
     def on_chord_part_return(self, task, state, result, propagate=None):
         if not self.implements_incr:
@@ -550,7 +550,11 @@ class KeyValueStoreBackend(BaseBackend):
                     ChordError('GroupResult {0} no longer exists'.format(gid)),
                 )
         val = self.incr(key)
-        if val >= len(deps):
+        size = len(deps)
+        if val > size:
+            logger.warning('Chord counter incremented too many times for %r',
+                           gid)
+        elif val == size:
             callback = maybe_signature(task.request.chord, app=app)
             j = deps.join_native if deps.supports_native_join else deps.join
             try:

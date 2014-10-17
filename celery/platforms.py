@@ -24,7 +24,6 @@ from collections import namedtuple
 from billiard import current_process
 # fileno used to be in this module
 from kombu.utils import maybe_fileno
-from kombu.utils.compat import get_errno
 from kombu.utils.encoding import safe_str
 from contextlib import contextmanager
 
@@ -36,6 +35,7 @@ _setproctitle = try_import('setproctitle')
 resource = try_import('resource')
 pwd = try_import('pwd')
 grp = try_import('grp')
+mputil = try_import('multiprocessing.util')
 
 __all__ = ['EX_OK', 'EX_FAILURE', 'EX_UNAVAILABLE', 'EX_USAGE', 'SYSTEM',
            'IS_OSX', 'IS_WINDOWS', 'pyimplementation', 'LockFailed',
@@ -56,7 +56,6 @@ SYSTEM = _platform.system()
 IS_OSX = SYSTEM == 'Darwin'
 IS_WINDOWS = SYSTEM == 'Windows'
 
-DAEMON_UMASK = 0
 DAEMON_WORKDIR = '/'
 
 PIDFILE_FLAGS = os.O_CREAT | os.O_EXCL | os.O_WRONLY
@@ -294,11 +293,16 @@ class DaemonContext(object):
     _is_open = False
 
     def __init__(self, pidfile=None, workdir=None, umask=None,
-                 fake=False, after_chdir=None, **kwargs):
+                 fake=False, after_chdir=None, after_forkers=True,
+                 **kwargs):
+        if isinstance(umask, string_t):
+            # octal or decimal, depending on initial zero.
+            umask = int(umask, 8 if umask.startswith('0') else 10)
         self.workdir = workdir or DAEMON_WORKDIR
-        self.umask = DAEMON_UMASK if umask is None else umask
+        self.umask = umask
         self.fake = fake
         self.after_chdir = after_chdir
+        self.after_forkers = after_forkers
         self.stdfds = (sys.stdin, sys.stdout, sys.stderr)
 
     def redirect_to_null(self, fd):
@@ -312,14 +316,18 @@ class DaemonContext(object):
                 self._detach()
 
             os.chdir(self.workdir)
-            os.umask(self.umask)
+            if self.umask is not None:
+                os.umask(self.umask)
 
             if self.after_chdir:
                 self.after_chdir()
 
-            close_open_fds(self.stdfds)
-            for fd in self.stdfds:
-                self.redirect_to_null(maybe_fileno(fd))
+            if not self.fake:
+                close_open_fds(self.stdfds)
+                for fd in self.stdfds:
+                    self.redirect_to_null(maybe_fileno(fd))
+                if self.after_forkers and mputil is not None:
+                    mputil._run_after_forkers()
 
             self._is_open = True
     __enter__ = open
@@ -525,7 +533,7 @@ def maybe_drop_privileges(uid=None, gid=None):
         try:
             setuid(0)
         except OSError as exc:
-            if get_errno(exc) != errno.EPERM:
+            if exc.errno != errno.EPERM:
                 raise
             pass  # Good: cannot restore privileges.
         else:

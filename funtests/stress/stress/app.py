@@ -33,7 +33,7 @@ class App(Celery):
             )
         )
         signals.user_preload_options.connect(self.on_preload_parsed)
-        self.after_configure = None
+        self.on_configure.connect(self._maybe_use_default_template)
 
     def on_preload_parsed(self, options=None, **kwargs):
         self.use_template(options['template'])
@@ -44,13 +44,7 @@ class App(Celery):
         use_template(self, name)
         self.template_selected = True
 
-    def _get_config(self):
-        ret = super(App, self)._get_config()
-        if self.after_configure:
-            self.after_configure(ret)
-        return ret
-
-    def on_configure(self):
+    def _maybe_use_default_template(self, **kwargs):
         if not self.template_selected:
             self.use_template('default')
 
@@ -116,7 +110,7 @@ def retries(self):
 
 
 @app.task
-def unicode():
+def print_unicode():
     print('hiöäüß')
 
 
@@ -125,6 +119,17 @@ def segfault():
     import ctypes
     ctypes.memset(0, 0, 1)
     assert False, 'should not get here'
+
+
+@app.task(bind=True)
+def chord_adds(self, x):
+    self.add_to_chord(add.s(x, x))
+    return 42
+
+
+@app.task(bind=True)
+def chord_replace(self, x):
+    return self.replace_in_chord(add.s(x, x))
 
 
 @app.task

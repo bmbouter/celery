@@ -16,11 +16,10 @@ from celery import current_app
 from celery import states
 from celery._state import _task_stack
 from celery.canvas import signature
-from celery.exceptions import MaxRetriesExceededError, Reject, Retry
-from celery.five import class_property, items, with_metaclass
-from celery.local import Proxy
+from celery.exceptions import Ignore, MaxRetriesExceededError, Reject, Retry
+from celery.five import class_property, items
 from celery.result import EagerResult
-from celery.utils import gen_task_name, fun_takes_kwargs, uuid, maybe_reraise
+from celery.utils import uuid, maybe_reraise
 from celery.utils.functional import mattrgetter, maybe_list
 from celery.utils.imports import instantiate
 from celery.utils.mail import ErrorMail
@@ -44,21 +43,8 @@ R_UNBOUND_TASK = '<unbound {0.__name__}{flags}>'
 R_SELF_TASK = '<@task {0.name} bound to other {0.__self__}>'
 R_INSTANCE = '<@task: {0.name} of {app}{flags}>'
 
-
-class _CompatShared(object):
-
-    def __init__(self, name, cons):
-        self.name = name
-        self.cons = cons
-
-    def __hash__(self):
-        return hash(self.name)
-
-    def __repr__(self):
-        return '<OldTask: %r>' % (self.name, )
-
-    def __call__(self, app):
-        return self.cons(app)
+#: Here for backwards compatibility as tasks no longer use a custom metaclass.
+TaskType = type
 
 
 def _strflags(flags, default=''):
@@ -93,6 +79,8 @@ class Context(object):
     headers = None
     delivery_info = None
     reply_to = None
+    root_id = None
+    parent_id = None
     correlation_id = None
     taskset = None   # compat alias to group
     group = None
@@ -128,84 +116,6 @@ class Context(object):
         return self._children
 
 
-class TaskType(type):
-    """Meta class for tasks.
-
-    Automatically registers the task in the task registry (except
-    if the :attr:`Task.abstract`` attribute is set).
-
-    If no :attr:`Task.name` attribute is provided, then the name is generated
-    from the module and class name.
-
-    """
-    _creation_count = {}  # used by old non-abstract task classes
-
-    def __new__(cls, name, bases, attrs):
-        new = super(TaskType, cls).__new__
-        task_module = attrs.get('__module__') or '__main__'
-
-        # - Abstract class: abstract attribute should not be inherited.
-        abstract = attrs.pop('abstract', None)
-        if abstract or not attrs.get('autoregister', True):
-            return new(cls, name, bases, attrs)
-
-        # The 'app' attribute is now a property, with the real app located
-        # in the '_app' attribute.  Previously this was a regular attribute,
-        # so we should support classes defining it.
-        app = attrs.pop('_app', None) or attrs.pop('app', None)
-
-        # Attempt to inherit app from one the bases
-        if not isinstance(app, Proxy) and app is None:
-            for base in bases:
-                if getattr(base, '_app', None):
-                    app = base._app
-                    break
-            else:
-                app = current_app._get_current_object()
-        attrs['_app'] = app
-
-        # - Automatically generate missing/empty name.
-        task_name = attrs.get('name')
-        if not task_name:
-            attrs['name'] = task_name = gen_task_name(app, name, task_module)
-
-        if not attrs.get('_decorated'):
-            # non decorated tasks must also be shared in case
-            # an app is created multiple times due to modules
-            # imported under multiple names.
-            # Hairy stuff,  here to be compatible with 2.x.
-            # People should not use non-abstract task classes anymore,
-            # use the task decorator.
-            from celery.app.builtins import shared_task
-            unique_name = '.'.join([task_module, name])
-            if unique_name not in cls._creation_count:
-                # the creation count is used as a safety
-                # so that the same task is not added recursively
-                # to the set of constructors.
-                cls._creation_count[unique_name] = 1
-                shared_task(_CompatShared(
-                    unique_name,
-                    lambda app: TaskType.__new__(cls, name, bases,
-                                                 dict(attrs, _app=app)),
-                ))
-
-        # - Create and register class.
-        # Because of the way import happens (recursively)
-        # we may or may not be the first time the task tries to register
-        # with the framework.  There should only be one class for each task
-        # name, so we always return the registered version.
-        tasks = app._tasks
-        if task_name not in tasks:
-            tasks.register(new(cls, name, bases, attrs))
-        instance = tasks[task_name]
-        instance.bind(app)
-        return instance.__class__
-
-    def __repr__(cls):
-        return _reprtask(cls)
-
-
-@with_metaclass(TaskType)
 class Task(object):
     """Task base class.
 
@@ -234,10 +144,6 @@ class Task(object):
 
     #: If :const:`True` the task is an abstract base class.
     abstract = True
-
-    #: If disabled the worker will not forward magic keyword arguments.
-    #: Deprecated and scheduled for removal in v4.0.
-    accept_magic_kwargs = False
 
     #: Maximum number of retries before giving up.  If set to :const:`None`,
     #: it will **never** stop retrying.
@@ -313,7 +219,7 @@ class Task(object):
     #: :setting:`CELERY_ACKS_LATE` setting.
     acks_late = None
 
-    #: List/tuple of expected exceptions.
+    #: Tuple of expected exceptions.
     #:
     #: These are errors that are expected in normal operation
     #: and that should not be regarded as a real error by the worker.
@@ -343,6 +249,9 @@ class Task(object):
             'CELERY_STORE_ERRORS_EVEN_IF_IGNORED'),
     )
 
+    #: ignored
+    accept_magic_kwargs = False
+
     _backend = None  # set by backend property.
 
     __bound__ = False
@@ -360,8 +269,6 @@ class Task(object):
         for attr_name, config_name in self.from_config:
             if getattr(self, attr_name, None) is None:
                 setattr(self, attr_name, conf[config_name])
-        if self.accept_magic_kwargs is None:
-            self.accept_magic_kwargs = app.accept_magic_kwargs
 
         # decorate with annotations from config.
         if not was_bound:
@@ -525,7 +432,7 @@ class Task(object):
         :keyword link_error: A single, or a list of tasks to apply
                       if an error occurs while executing the task.
 
-        :keyword producer: :class:~@kombu.Producer` instance to use.
+        :keyword producer: :class:`~@kombu.Producer` instance to use.
         :keyword add_to_parent: If set to True (default) and the task
             is applied while executing another task, then the result
             will be appended to the parent tasks ``request.children``
@@ -555,8 +462,8 @@ class Task(object):
             **dict(self._get_exec_options(), **options)
         )
 
-    def subtask_from_request(self, request=None, args=None, kwargs=None,
-                             queue=None, **extra_options):
+    def signature_from_request(self, request=None, args=None, kwargs=None,
+                               queue=None, **extra_options):
         request = self.request if request is None else request
         args = request.args if args is None else args
         kwargs = request.kwargs if kwargs is None else kwargs
@@ -569,11 +476,15 @@ class Task(object):
             'chord': request.chord,
             'soft_time_limit': limit_soft,
             'time_limit': limit_hard,
+            'reply_to': request.reply_to,
         }
         options.update(
             {'queue': queue} if queue else (request.delivery_info or {})
         )
-        return self.subtask(args, kwargs, options, type=self, **extra_options)
+        return self.signature(
+            args, kwargs, options, type=self, **extra_options
+        )
+    subtask_from_request = signature_from_request
 
     def retry(self, args=None, kwargs=None, exc=None, throw=True,
               eta=None, countdown=None, max_retries=None, **options):
@@ -647,7 +558,7 @@ class Task(object):
             countdown = self.default_retry_delay
 
         is_eager = request.is_eager
-        S = self.subtask_from_request(
+        S = self.signature_from_request(
             request, args, kwargs,
             countdown=countdown, eta=eta, retries=retries,
             **options
@@ -658,20 +569,23 @@ class Task(object):
                 # first try to reraise the original exception
                 maybe_reraise()
                 # or if not in an except block then raise the custom exc.
-                raise exc()
+                raise exc
             raise self.MaxRetriesExceededError(
                 "Can't retry {0}[{1}] args:{2} kwargs:{3}".format(
                     self.name, request.id, S.args, S.kwargs))
 
-        # If task was executed eagerly using apply(),
-        # then the retry must also be executed eagerly.
-        try:
-            S.apply().get() if is_eager else S.apply_async()
-        except Exception as exc:
-            if is_eager:
-                raise
-            raise Reject(exc, requeue=True)
         ret = Retry(exc=exc, when=eta or countdown)
+
+        if is_eager:
+            # if task was executed eagerly using apply(),
+            # then the retry must also be executed eagerly.
+            S.apply().get()
+            return ret
+
+        try:
+            S.apply_async()
+        except Exception as exc:
+            raise Reject(exc, requeue=False)
         if throw:
             raise ret
         return ret
@@ -690,7 +604,7 @@ class Task(object):
 
         """
         # trace imports Task, so need to import inline.
-        from celery.app.trace import eager_trace_task
+        from celery.app.trace import build_tracer
 
         app = self._get_app()
         args = args or ()
@@ -715,28 +629,16 @@ class Task(object):
                    'errbacks': maybe_list(link_error),
                    'headers': options.get('headers'),
                    'delivery_info': {'is_eager': True}}
-        if self.accept_magic_kwargs:
-            default_kwargs = {'task_name': task.name,
-                              'task_id': task_id,
-                              'task_retries': retries,
-                              'task_is_eager': True,
-                              'logfile': options.get('logfile'),
-                              'loglevel': options.get('loglevel', 0),
-                              'delivery_info': {'is_eager': True}}
-            supported_keys = fun_takes_kwargs(task.run, default_kwargs)
-            extend_with = {
-                key: val for key, val in items(default_kwargs)
-                if key in supported_keys
-            }
-            kwargs.update(extend_with)
-
         tb = None
-        retval, info = eager_trace_task(task, task_id, args, kwargs,
-                                        app=self._get_app(),
-                                        request=request, propagate=throw)
+        tracer = build_tracer(
+            task.name, task, eager=True,
+            propagate=throw, app=self._get_app(),
+        )
+        ret = tracer(task_id, args, kwargs, request)
+        retval = ret.retval
         if isinstance(retval, ExceptionInfo):
             retval, tb = retval.exception, retval.traceback
-        state = states.SUCCESS if info is None else info.state
+        state = states.SUCCESS if ret.info is None else ret.info.state
         return EagerResult(task_id, retval, state, traceback=tb)
 
     def AsyncResult(self, task_id, **kwargs):
@@ -748,20 +650,21 @@ class Task(object):
         return self._get_app().AsyncResult(task_id, backend=self.backend,
                                            task_name=self.name, **kwargs)
 
-    def subtask(self, args=None, *starargs, **starkwargs):
+    def signature(self, args=None, *starargs, **starkwargs):
         """Return :class:`~celery.signature` object for
         this task, wrapping arguments and execution options
         for a single task invocation."""
         starkwargs.setdefault('app', self.app)
         return signature(self, args, *starargs, **starkwargs)
+    subtask = signature
 
     def s(self, *args, **kwargs):
-        """``.s(*a, **k) -> .subtask(a, k)``"""
-        return self.subtask(args, kwargs)
+        """``.s(*a, **k) -> .signature(a, k)``"""
+        return self.signature(args, kwargs)
 
     def si(self, *args, **kwargs):
-        """``.si(*a, **k) -> .subtask(a, k, immutable=True)``"""
-        return self.subtask(args, kwargs, immutable=True)
+        """``.si(*a, **k) -> .signature(a, k, immutable=True)``"""
+        return self.signature(args, kwargs, immutable=True)
 
     def chunks(self, it, n):
         """Creates a :class:`~celery.canvas.chunks` task for this task."""
@@ -782,6 +685,54 @@ class Task(object):
         req = self.request
         with self.app.events.default_dispatcher(hostname=req.hostname) as d:
             return d.send(type_, uuid=req.id, **fields)
+
+    def replace(self, sig):
+        request = self.request
+        sig.set_immutable(True)
+        chord_id, request.chord = request.chord, None
+        group_id, request.group = request.group, None
+        callbacks, request.callbacks = request.callbacks, [sig]
+        if group_id or chord_id:
+            sig.set(group=group_id, chord=chord_id)
+        sig |= callbacks[0]
+        return sig
+
+    def replace_in_chord(self, sig):
+        """Replace the current task (which must be a member of a chord)
+        with a new task.
+
+        Note that this will raise :exc:`~@Ignore`, so the best practice
+        is to always use ``return self.replace_in_chord(...)`` to convey
+        to the reader that the task will not continue after being replaced.
+
+        :param: Signature of new task.
+
+        """
+        sig.freeze(self.request.id,
+                   group_id=self.request.group,
+                   chord=self.request.chord,
+                   root_id=self.request.root_id)
+        sig.delay()
+        raise Ignore('Chord member replaced by new task')
+
+    def add_to_chord(self, sig, lazy=False):
+        """Add signature to the chord the current task is a member of.
+
+        :param sig: Signature to extend chord with.
+        :param lazy: If enabled the new task will not actually be called,
+                      and ``sig.delay()`` must be called manually.
+
+        Currently only supported by the Redis result backend when
+        ``?new_join=1`` is enabled.
+
+        """
+        if not self.request.chord:
+            raise ValueError('Current task is not member of any chord')
+        result = sig.freeze(group_id=self.request.group,
+                            chord=self.request.chord,
+                            root_id=self.request.root_id)
+        self.backend.add_to_chord(self.request.group, result)
+        return sig.delay() if not lazy else sig
 
     def update_state(self, task_id=None, state=None, meta=None):
         """Update task state.

@@ -1,11 +1,11 @@
-from __future__ import print_function
+from __future__ import print_function, unicode_literals
 
 from fileinput import input as _input
 from sys import exit, stderr
 
 from celery.app.defaults import NAMESPACES, flatten
 
-ignore = frozenset([
+ignore = {
     'CELERYD_AGENT',
     'CELERYD_POOL_PUTLOCKS',
     'BROKER_HOST',
@@ -13,11 +13,12 @@ ignore = frozenset([
     'BROKER_PASSWORD',
     'BROKER_VHOST',
     'BROKER_PORT',
+    'CELERY_CHORD_PROPAGATES',
     'CELERY_REDIS_HOST',
     'CELERY_REDIS_PORT',
     'CELERY_REDIS_DB',
     'CELERY_REDIS_PASSWORD',
-])
+}
 
 
 def is_ignored(setting, option):
@@ -27,8 +28,9 @@ def is_ignored(setting, option):
 def find_undocumented_settings(directive='.. setting:: '):
     settings = dict(flatten(NAMESPACES))
     all = set(settings)
+    inp = (l.decode('utf-8') for l in _input())
     documented = set(
-        line.strip()[len(directive):].strip() for line in _input()
+        line.strip()[len(directive):].strip() for line in inp
         if line.strip().startswith(directive)
     )
     return [setting for setting in all ^ documented

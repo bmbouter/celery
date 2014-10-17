@@ -16,13 +16,13 @@ Examples
     # this.  The abbreviation %n will be expanded to the current
     # node name.
     $ celery multi start Leslie -E --pidfile=/var/run/celery/%n.pid
-                                    --logfile=/var/log/celery/%n.log
+                                   --logfile=/var/log/celery/%n%I.log
 
 
     # You need to add the same arguments when you restart,
     # as these are not persisted anywhere.
     $ celery multi restart Leslie -E --pidfile=/var/run/celery/%n.pid
-                                     --logfile=/var/run/celery/%n.log
+                                     --logfile=/var/run/celery/%n%I.log
 
     # To stop the node, you need to specify the same pidfile.
     $ celery multi stop Leslie --pidfile=/var/run/celery/%n.pid
@@ -103,13 +103,12 @@ import signal
 import socket
 import sys
 
-from collections import defaultdict, namedtuple
+from collections import OrderedDict, defaultdict, namedtuple
 from functools import partial
 from subprocess import Popen
 from time import sleep
 
 from kombu.utils import cached_property
-from kombu.utils.compat import OrderedDict
 from kombu.utils.encoding import from_utf8
 
 from celery import VERSION_BANNER
@@ -168,8 +167,10 @@ class MultiTool(object):
     retcode = 0  # Final exit code.
 
     def __init__(self, env=None, fh=None, quiet=False, verbose=False,
-                 no_color=False, nosplash=False):
-        self.fh = fh or sys.stderr
+                 no_color=False, nosplash=False, stdout=None, stderr=None):
+        """fh is an old alias to stdout."""
+        self.stdout = self.fh = stdout or fh or sys.stdout
+        self.stderr = stderr or sys.stderr
         self.env = env
         self.nosplash = nosplash
         self.quiet = quiet
@@ -214,8 +215,11 @@ class MultiTool(object):
 
         return self.retcode
 
-    def say(self, m, newline=True):
-        print(m, file=self.fh, end='\n' if newline else '')
+    def say(self, m, newline=True, file=None):
+        print(m, file=file or self.stdout, end='\n' if newline else '')
+
+    def carp(self, m, newline=True, file=None):
+        return self.say(m, newline, file or self.stderr)
 
     def names(self, argv, cmd):
         p = NamespacedOptionParser(argv)
@@ -253,7 +257,7 @@ class MultiTool(object):
 
     def with_detacher_default_options(self, p):
         _setdefaultopt(p.options, ['--pidfile', '-p'], '%n.pid')
-        _setdefaultopt(p.options, ['--logfile', '-f'], '%n.log')
+        _setdefaultopt(p.options, ['--logfile', '-f'], '%n%I.log')
         p.options.setdefault(
             '--cmd',
             '-m {0}'.format(celery_exe('worker', '--detach')),
@@ -425,7 +429,7 @@ class MultiTool(object):
 
     def error(self, msg=None):
         if msg:
-            self.say(msg)
+            self.carp(msg)
         self.usage()
         self.retcode = 1
         return 1
@@ -509,7 +513,7 @@ def multi_args(p, cmd='celery worker', append='', prefix='', suffix=''):
 
         expand = partial(
             node_format, nodename=nodename, N=shortname, d=hostname,
-            h=nodename,
+            h=nodename, i='%i', I='%I',
         )
         argv = ([expand(cmd)] +
                 [format_opt(opt, expand(value))

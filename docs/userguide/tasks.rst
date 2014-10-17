@@ -19,7 +19,7 @@ many messages in advance and even if the worker is killed -- caused by power fai
 or otherwise -- the message will be redelivered to another worker.
 
 Ideally task functions should be :term:`idempotent`, which means that
-the function will not cause unintented effects even if called
+the function will not cause unintended effects even if called
 multiple times with the same arguments.
 Since the worker cannot detect if your tasks are idempotent, the default
 behavior is to acknowledge the message in advance, before it's executed,
@@ -45,7 +45,7 @@ Basics
 ======
 
 You can easily create a task from any callable by using
-the :meth:`~@Celery.task` decorator:
+the :meth:`~@task` decorator:
 
 .. code-block:: python
 
@@ -215,6 +215,55 @@ on the automatic naming:
     def add(x, y):
         return x + y
 
+.. _task-name-generator-info:
+
+Changing the automatic naming behavior
+--------------------------------------
+
+.. versionadded:: 3.2
+
+There are some cases when the default automatic naming is not suitable.
+Consider you have many tasks within many different modules::
+
+    project/
+           /__init__.py
+           /celery.py
+           /moduleA/
+                   /__init__.py
+                   /tasks.py
+           /moduleB/
+                   /__init__.py
+                   /tasks.py
+
+Using the default automatic naming, each task will have a generated name
+like `moduleA.tasks.taskA`, `moduleA.tasks.taskB`, `moduleB.tasks.test`
+and so on. You may want to get rid of having `tasks` in all task names.
+As pointed above, you can explicitly give names for all tasks, or you
+can change the automatic naming behavior by overriding
+:meth:`@gen_task_name`. Continuing with the example, `celery.py`
+may contain:
+
+.. code-block:: python
+
+    from celery import Celery
+
+    class MyCelery(Celery):
+
+        def gen_task_name(self, name, module):
+            if module.endswith('.tasks'):
+                module = module[:-6]
+            return super(MyCelery, self).gen_task_name(name, module)
+
+    app = MyCelery('main')
+
+So each task will have a name like `moduleA.taskA`, `moduleA.taskB` and
+`moduleB.test`.
+
+.. warning::
+
+    Make sure that your :meth:`@gen_task_name` is a pure function, which means
+    that for the same input it must always return the same output.
+
 .. _task-request-info:
 
 Context
@@ -266,9 +315,9 @@ The request defines the following attributes:
 :called_directly: This flag is set to true if the task was not
                   executed by the worker.
 
-:callbacks: A list of subtasks to be called if this task returns successfully.
+:callbacks: A list of signatures to be called if this task returns successfully.
 
-:errback: A list of subtasks to be called if this task fails.
+:errback: A list of signatures to be called if this task fails.
 
 :utc: Set to true the caller has utc enabled (:setting:`CELERY_ENABLE_UTC`).
 
@@ -327,8 +376,34 @@ for which documentation can be found in the :mod:`logging`
 module.
 
 You can also use :func:`print`, as anything written to standard
-out/-err will be redirected to logging system (you can disable this,
+out/-err will be redirected to the logging system (you can disable this,
 see :setting:`CELERY_REDIRECT_STDOUTS`).
+
+.. note::
+
+    The worker will not update the redirection if you create a logger instance
+    somewhere in your task or task module.
+
+    If you want to redirect ``sys.stdout`` and ``sys.stderr`` to a custom
+    logger you have to enable this manually, for example:
+
+    .. code-block:: python
+
+        import sys
+
+        logger = get_task_logger(__name__)
+
+        @app.task(bind=True)
+        def add(self, x, y):
+            old_outs = sys.stdout, sys.stderr
+            rlevel = self.app.conf.CELERY_REDIRECT_STDOUTS_LEVEL
+            try:
+                self.app.log.redirect_stdouts_to_logger(logger, rlevel)
+                print('Adding {0} + {1}'.format(x, y))
+                return x + y
+            finally:
+                sys.stdout, sys.stderr = old_outs
+
 
 .. _task-retry:
 
@@ -472,7 +547,7 @@ General
 
 .. attribute:: Task.throws
 
-    Optional list of expected error classes that should not be regarded
+    Optional tuple of expected error classes that should not be regarded
     as an actual error.
 
     Errors in this list will be reported as a failure to the result backend,
@@ -514,10 +589,19 @@ General
     If it is an integer or float, it is interpreted as "tasks per second".
 
     The rate limits can be specified in seconds, minutes or hours
-    by appending `"/s"`, `"/m"` or `"/h"` to the value.
-    Example: `"100/m"` (hundred tasks a minute).  Default is the
-    :setting:`CELERY_DEFAULT_RATE_LIMIT` setting, which if not specified means
-    rate limiting for tasks is disabled by default.
+    by appending `"/s"`, `"/m"` or `"/h"` to the value.  Tasks will be evenly
+    distributed over the specified time frame.
+
+    Example: `"100/m"` (hundred tasks a minute). This will enforce a minimum
+    delay of 600ms between starting two tasks on the same worker instance.
+    
+    Default is the :setting:`CELERY_DEFAULT_RATE_LIMIT` setting,
+    which if not specified means rate limiting for tasks is disabled by default.
+
+    Note that this is a *per worker instance* rate limit, and not a global
+    rate limit. To enforce a global rate limit (e.g. for an API with a
+    maximum number of  requests per second), you must restrict to a given
+    queue.
 
 .. attribute:: Task.time_limit
 
@@ -1162,8 +1246,8 @@ yourself:
 
 .. code-block:: python
 
-    >>> from celery import current_app
-    >>> current_app.tasks
+    >>> from proj.celery import app
+    >>> app.tasks
     {'celery.chord_unlock':
         <@task: celery.chord_unlock>,
      'celery.backend_cleanup':
@@ -1297,7 +1381,7 @@ Make your design asynchronous instead, for example by using *callbacks*.
 
 
 Here I instead created a chain of tasks by linking together
-different :func:`~celery.subtask`'s.
+different :func:`~celery.signature`'s.
 You can read about chains and other powerful constructs
 at :ref:`designing-workflows`.
 

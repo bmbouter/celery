@@ -463,7 +463,7 @@ Methods
 .. method:: apply_eta_task(request)
 
     Schedule eta task to execute based on the ``request.eta`` attribute.
-    (:class:`~celery.worker.job.Request`)
+    (:class:`~celery.worker.request.Request`)
 
 
 
@@ -613,7 +613,7 @@ Command-specific options
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
 You can add additional command-line options to the ``worker``, ``beat`` and
-``events`` commands by modifying the :attr:`~@Celery.user_options` attribute of the
+``events`` commands by modifying the :attr:`~@user_options` attribute of the
 application instance.
 
 Celery commands uses the :mod:`optparse` module to parse command-line
@@ -768,7 +768,7 @@ will take some time so other transports still use a threading-based solution.
 
     Add callback to be called when ``fd`` is readable.
 
-    The callback will stay registered until explictly removed using
+    The callback will stay registered until explicitly removed using
     :meth:`hub.remove(fd) <hub.remove>`, or the fd is automatically discarded
     because it's no longer valid.
 

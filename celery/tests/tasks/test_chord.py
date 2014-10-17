@@ -2,7 +2,7 @@ from __future__ import absolute_import
 
 from contextlib import contextmanager
 
-from celery import group
+from celery import group, uuid
 from celery import canvas
 from celery import result
 from celery.exceptions import ChordError, Retry
@@ -142,7 +142,7 @@ class test_unlock_chord_task(ChordCase):
         fail_current = self.app.backend.fail_from_current_stack = Mock()
         try:
             with patch_unlock_retry(self.app) as (unlock, retry):
-                subtask, canvas.maybe_signature = (
+                signature, canvas.maybe_signature = (
                     canvas.maybe_signature, passthru,
                 )
                 if setup:
@@ -160,7 +160,7 @@ class test_unlock_chord_task(ChordCase):
                     except Retry:
                         pass
                 finally:
-                    canvas.maybe_signature = subtask
+                    canvas.maybe_signature = signature
                 yield callback_s, retry, fail_current
         finally:
             result.GroupResult = pts
@@ -205,18 +205,69 @@ class test_chord(ChordCase):
         m = Mock()
         m.app.conf.CELERY_ALWAYS_EAGER = False
         m.AsyncResult = AsyncResult
-        prev, chord._type = chord._type, m
+        prev, chord.run = chord.run, m
         try:
             x = chord(self.add.s(i, i) for i in range(10))
             body = self.add.s(2)
             result = x(body)
             self.assertTrue(result.id)
-            # does not modify original subtask
+            # does not modify original signature
             with self.assertRaises(KeyError):
                 body.options['task_id']
-            self.assertTrue(chord._type.called)
+            self.assertTrue(chord.run.called)
         finally:
-            chord._type = prev
+            chord.run = prev
+
+
+class test_add_to_chord(AppCase):
+
+    def setup(self):
+
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+        self.add = add
+
+        @self.app.task(shared=False, bind=True)
+        def adds(self, sig, lazy=False):
+            return self.add_to_chord(sig, lazy)
+        self.adds = adds
+
+    def test_add_to_chord(self):
+        self.app.backend = Mock(name='backend')
+
+        sig = self.add.s(2, 2)
+        sig.delay = Mock(name='sig.delay')
+        self.adds.request.group = uuid()
+        self.adds.request.id = uuid()
+
+        with self.assertRaises(ValueError):
+            # task not part of chord
+            self.adds.run(sig)
+        self.adds.request.chord = self.add.s()
+
+        res1 = self.adds.run(sig, True)
+        self.assertEqual(res1, sig)
+        self.assertTrue(sig.options['task_id'])
+        self.assertEqual(sig.options['group_id'], self.adds.request.group)
+        self.assertEqual(sig.options['chord'], self.adds.request.chord)
+        self.assertFalse(sig.delay.called)
+        self.app.backend.add_to_chord.assert_called_with(
+            self.adds.request.group, sig.freeze(),
+        )
+
+        self.app.backend.reset_mock()
+        sig2 = self.add.s(4, 4)
+        sig2.delay = Mock(name='sig2.delay')
+        res2 = self.adds.run(sig2)
+        self.assertEqual(res2, sig2.delay.return_value)
+        self.assertTrue(sig2.options['task_id'])
+        self.assertEqual(sig2.options['group_id'], self.adds.request.group)
+        self.assertEqual(sig2.options['chord'], self.adds.request.chord)
+        sig2.delay.assert_called_with()
+        self.app.backend.add_to_chord.assert_called_with(
+            self.adds.request.group, sig2.freeze(),
+        )
 
 
 class test_Chord_task(ChordCase):
@@ -227,7 +278,7 @@ class test_Chord_task(ChordCase):
         self.app.backend.cleanup.__name__ = 'cleanup'
         Chord = self.app.tasks['celery.chord']
 
-        body = dict()
-        Chord(group(self.add.subtask((i, i)) for i in range(5)), body)
-        Chord([self.add.subtask((j, j)) for j in range(5)], body)
+        body = self.add.signature()
+        Chord(group(self.add.signature((i, i)) for i in range(5)), body)
+        Chord([self.add.signature((j, j)) for j in range(5)], body)
         self.assertEqual(self.app.backend.apply_chord.call_count, 2)

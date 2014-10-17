@@ -164,6 +164,12 @@ workers, note that the first worker to start will receive four times the
 number of messages initially.  Thus the tasks may not be fairly distributed
 to the workers.
 
+To disable prefetching, set CELERYD_PREFETCH_MULTIPLIER to 1.  Setting 
+CELERYD_PREFETCH_MULTIPLIER to 0 will allow the worker to keep consuming
+as many messages as it wants.
+
+For more on prefetching, read :ref:`optimizing-prefetch-limit`
+
 .. note::
 
     Tasks with ETA/countdown are not affected by prefetch limits.
@@ -335,7 +341,7 @@ AMQP backend settings
 .. note::
 
     The AMQP backend requires RabbitMQ 1.1.0 or higher to automatically
-    expire results.  If you are running an older version of RabbitmQ
+    expire results.  If you are running an older version of RabbitMQ
     you should disable result expiration like this:
 
         CELERY_TASK_RESULT_EXPIRES = None
@@ -455,7 +461,7 @@ which is the same as::
 
     CELERY_RESULT_BACKEND = 'redis://'
 
-The fields of the URL is defined as folows:
+The fields of the URL are defined as follows:
 
 - *host*
 
@@ -628,6 +634,71 @@ Example configuration
         'max_retries': 10
     }
 
+.. _conf-riak-result-backend:
+
+Riak backend settings
+---------------------
+
+.. note::
+
+    The Riak backend requires the :mod:`riak` library:
+    http://pypi.python.org/pypi/riak/
+
+    To install the riak package use `pip` or `easy_install`:
+
+    .. code-block:: bash
+
+        $ pip install riak
+
+This backend requires the :setting:`CELERY_RESULT_BACKEND`
+setting to be set to a Riak URL::
+
+    CELERY_RESULT_BACKEND = "riak://host:port/bucket"
+
+For example::
+
+    CELERY_RESULT_BACKEND = "riak://localhost/celery
+
+which is the same as::
+
+    CELERY_RESULT_BACKEND = "riak://"
+
+The fields of the URL are defined as follows:
+
+- *host*
+
+Host name or IP address of the Riak server. e.g. `"localhost"`.
+
+- *port*
+
+Port to the Riak server using the protobuf protocol. Default is 8087.
+
+- *bucket*
+
+Bucket name to use. Default is `celery`.
+The bucket needs to be a string with ascii characters only.
+
+Altenatively, this backend can be configured with the following configuration directives.
+
+.. setting:: CELERY_RIAK_BACKEND_SETTINGS
+
+CELERY_RIAK_BACKEND_SETTINGS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This is a dict supporting the following keys:
+
+* host
+    The host name of the Riak server. Defaults to "localhost".
+
+* port
+    The port the Riak server is listening to. Defaults to 8087.
+
+* bucket
+    The bucket name to connect to. Defaults to "celery".
+
+* protocol
+    The protocol to use to connect to the Riak server. This is not configurable
+    via :setting:`CELERY_RESULT_BACKEND`
 
 .. _conf-ironcache-result-backend:
 
@@ -714,13 +785,20 @@ Message Routing
 CELERY_QUEUES
 ~~~~~~~~~~~~~
 
-The mapping of queues the worker consumes from.  This is a dictionary
-of queue name/options.  See :ref:`guide-routing` for more information.
+Most users will not want to specify this setting and should rather use
+the :ref:`automatic routing facilities <routing-automatic>`.
+
+If you really want to configure advanced routing, this setting should
+be a list of :class:`kombu.Queue` objects the worker will consume from.
+
+Note that workers can be overriden this setting via the `-Q` option,
+or individual queues from this list (by name) can be excluded using
+the `-X` option.
+
+Also see :ref:`routing-basics` for more information.
 
 The default is a queue/exchange/binding key of ``celery``, with
 exchange type ``direct``.
-
-You don't have to care about this unless you want custom routing facilities.
 
 .. setting:: CELERY_ROUTES
 
@@ -895,26 +973,6 @@ Example::
     BROKER_FAILOVER_STRATEGY=random_failover_strategy
 
 .. setting:: BROKER_TRANSPORT
-
-BROKER_FAILOVER_STRATEGY
-~~~~~~~~~~~~~~~~~~~~~~~~
-
-Default failover strategy for the broker Connection object. If supplied,
-may map to a key in 'kombu.connection.failover_strategies', or be a reference
-to any method that yields a single item from a supplied list.
-
-Example::
-
-    # Random failover strategy
-    def random_failover_strategy(servers):
-        it = list(it)  # don't modify callers list
-        shuffle = random.shuffle
-        for _ in repeat(None):
-            shuffle(it)
-            yield it[0]
-
-    BROKER_FAILOVER_STRATEGY=random_failover_strategy
-
 
 BROKER_TRANSPORT
 ~~~~~~~~~~~~~~~~
@@ -1110,6 +1168,14 @@ compression schemes registered in the Kombu compression registry.
 
 The default is to send uncompressed messages.
 
+.. setting:: CELERY_TASK_PROTOCOL
+
+CELERY_TASK_PROTOCOL
+~~~~~~~~~~~~~~~~~~~~
+
+Default task message protocol version.
+Supports protocols: 1 and 2 (default is 1 for backwards compatibility).
+
 .. setting:: CELERY_TASK_RESULT_EXPIRES
 
 CELERY_TASK_RESULT_EXPIRES
@@ -1144,29 +1210,6 @@ Result backends caches ready results used by the client.
 This is the total number of results to cache before older results are evicted.
 The default is 5000.  0 or None means no limit, and a value of :const:`-1`
 will disable the cache.
-
-.. setting:: CELERY_CHORD_PROPAGATES
-
-CELERY_CHORD_PROPAGATES
-~~~~~~~~~~~~~~~~~~~~~~~
-
-.. versionadded:: 3.0.14
-
-This setting defines what happens when a task part of a chord raises an
-exception:
-
-- If propagate is True the chord callback will change state to FAILURE
-  with the exception value set to a :exc:`~@ChordError`
-  instance containing information about the error and the task that failed.
-
-    This is the default behavior in Celery 3.1+
-
-- If propagate is False the exception value will instead be forwarded
-  to the chord callback.
-
-    This was the default behavior before version 3.1.
-
-.. setting:: CELERY_TRACK_STARTED
 
 CELERY_TRACK_STARTED
 ~~~~~~~~~~~~~~~~~~~~
@@ -1509,7 +1552,8 @@ Events
 CELERY_SEND_EVENTS
 ~~~~~~~~~~~~~~~~~~
 
-Send events so the worker can be monitored by tools like `celerymon`.
+Send task-related events so that tasks can be monitored using tools like
+`flower`.  Sets the default value for the workers :option:`-E` argument.
 
 .. setting:: CELERY_SEND_TASK_SENT_EVENT
 

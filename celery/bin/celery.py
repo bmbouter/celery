@@ -8,13 +8,14 @@ The :program:`celery` umbrella command.
 """
 from __future__ import absolute_import, unicode_literals
 
-import anyjson
 import numbers
 import os
 import sys
 
 from functools import partial
 from importlib import import_module
+
+from kombu.utils import json
 
 from celery.five import string_t, values
 from celery.platforms import EX_OK, EX_FAILURE, EX_UNAVAILABLE, EX_USAGE
@@ -162,12 +163,12 @@ class call(Command):
         # Positional args.
         args = kw.get('args') or ()
         if isinstance(args, string_t):
-            args = anyjson.loads(args)
+            args = json.loads(args)
 
         # Keyword args.
         kwargs = kw.get('kwargs') or {}
         if isinstance(kwargs, string_t):
-            kwargs = anyjson.loads(kwargs)
+            kwargs = json.loads(kwargs)
 
         # Expires can be int/float.
         expires = kw.get('expires') or None
@@ -268,7 +269,10 @@ class _RemoteControl(Command):
         Option('--timeout', '-t', type='float',
                help='Timeout in seconds (float) waiting for reply'),
         Option('--destination', '-d',
-               help='Comma separated list of destination node names.'))
+               help='Comma separated list of destination node names.'),
+        Option('--json', '-j', action='store_true',
+               help='Use json as output format.'),
+    )
 
     def __init__(self, *args, **kwargs):
         self.show_body = kwargs.pop('show_body', True)
@@ -334,6 +338,7 @@ class _RemoteControl(Command):
         if self.app.connection().transport.driver_type == 'sql':
             raise self.Error('Broadcast not supported by SQL broker transport')
 
+        output_json = kwargs.get('json')
         destination = kwargs.get('destination')
         timeout = kwargs.get('timeout') or self.choices[method][0]
         if destination and isinstance(destination, string_t):
@@ -341,12 +346,16 @@ class _RemoteControl(Command):
 
         handler = getattr(self, method, self.call)
 
+        callback = None if output_json else self.say_remote_command_reply
+
         replies = handler(method, *args[1:], timeout=timeout,
                           destination=destination,
-                          callback=self.say_remote_command_reply)
+                          callback=callback)
         if not replies:
             raise self.Error('No nodes replied within time constraint.',
                              status=EX_UNAVAILABLE)
+        if output_json:
+            self.out(json.dumps(replies))
         return replies
 
 

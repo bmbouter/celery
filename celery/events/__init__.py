@@ -13,9 +13,8 @@ from __future__ import absolute_import
 import os
 import time
 import threading
-import warnings
 
-from collections import deque
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from copy import copy
 from operator import itemgetter
@@ -26,6 +25,7 @@ from kombu.mixins import ConsumerMixin
 from kombu.utils import cached_property
 
 from celery.app import app_or_default
+from celery.five import items
 from celery.utils import anon_nodename, uuid
 from celery.utils.functional import dictfilter
 from celery.utils.timeutils import adjust_timestamp, utcoffset, maybe_s_to_ms
@@ -35,14 +35,6 @@ __all__ = ['Events', 'Event', 'EventDispatcher', 'EventReceiver']
 event_exchange = Exchange('celeryev', type='topic')
 
 _TZGETTER = itemgetter('utcoffset', 'timestamp')
-
-W_YAJL = """
-anyjson is currently using the yajl library.
-This json implementation is broken, it severely truncates floats
-so timestamps will not work.
-
-Please uninstall yajl or force anyjson to use a different library.
-"""
 
 CLIENT_CLOCK_SKEW = -1
 
@@ -124,12 +116,17 @@ class EventDispatcher(object):
 
     def __init__(self, connection=None, hostname=None, enabled=True,
                  channel=None, buffer_while_offline=True, app=None,
-                 serializer=None, groups=None):
+                 serializer=None, groups=None, delivery_mode=1,
+                 buffer_group=None, buffer_limit=24, on_send_buffered=None):
         self.app = app_or_default(app or self.app)
         self.connection = connection
         self.channel = channel
         self.hostname = hostname or anon_nodename()
         self.buffer_while_offline = buffer_while_offline
+        self.buffer_group = buffer_group or frozenset()
+        self.buffer_limit = buffer_limit
+        self.on_send_buffered = on_send_buffered
+        self._group_buffer = defaultdict(list)
         self.mutex = threading.Lock()
         self.producer = None
         self._outbound_buffer = deque()
@@ -139,6 +136,7 @@ class EventDispatcher(object):
         self.groups = set(groups or [])
         self.tzoffset = [-time.timezone, -time.altzone]
         self.clock = self.app.clock
+        self.delivery_mode = delivery_mode
         if not connection and channel:
             self.connection = channel.connection.client
         self.enabled = enabled
@@ -150,12 +148,6 @@ class EventDispatcher(object):
             self.enable()
         self.headers = {'hostname': self.hostname}
         self.pid = os.getpid()
-        self.warn_if_yajl()
-
-    def warn_if_yajl(self):
-        import anyjson
-        if anyjson.implementation.name == 'yajl':
-            warnings.warn(UserWarning(W_YAJL))
 
     def __enter__(self):
         return self
@@ -178,9 +170,8 @@ class EventDispatcher(object):
             for callback in self.on_disabled:
                 callback()
 
-    def publish(self, type, fields, producer, retry=False,
-                retry_policy=None, blind=False, utcoffset=utcoffset,
-                Event=Event):
+    def publish(self, type, fields, producer,
+                blind=False, Event=Event, **kwargs):
         """Publish event using a custom :class:`~kombu.Producer`
         instance.
 
@@ -198,24 +189,34 @@ class EventDispatcher(object):
         :keyword utcoffset: Function returning the current utcoffset in hours.
 
         """
-
+        clock = None if blind else self.clock.forward()
+        event = Event(type, hostname=self.hostname, utcoffset=utcoffset(),
+                      pid=self.pid, clock=clock, **fields)
         with self.mutex:
-            clock = None if blind else self.clock.forward()
-            event = Event(type, hostname=self.hostname, utcoffset=utcoffset(),
-                          pid=self.pid, clock=clock, **fields)
-            exchange = self.exchange
+            return self._publish(event, producer,
+                                 routing_key=type.replace('-', '.'), **kwargs)
+
+    def _publish(self, event, producer, routing_key, retry=False,
+                 retry_policy=None, utcoffset=utcoffset):
+        exchange = self.exchange
+        try:
             producer.publish(
                 event,
-                routing_key=type.replace('-', '.'),
+                routing_key=routing_key,
                 exchange=exchange.name,
                 retry=retry,
                 retry_policy=retry_policy,
                 declare=[exchange],
                 serializer=self.serializer,
                 headers=self.headers,
+                delivery_mode=self.delivery_mode,
             )
+        except Exception as exc:
+            if not self.buffer_while_offline:
+                raise
+            self._outbound_buffer.append((event, routing_key, exc))
 
-    def send(self, type, blind=False, **fields):
+    def send(self, type, blind=False, utcoffset=utcoffset, **fields):
         """Send event.
 
         :param type: Event type name, with group separated by dash (`-`).
@@ -231,24 +232,38 @@ class EventDispatcher(object):
 
         """
         if self.enabled:
-            groups = self.groups
-            if groups and group_from(type) not in groups:
+            groups, group = self.groups, group_from(type)
+            if groups and group not in groups:
                 return
-            try:
-                self.publish(type, fields, self.producer, blind)
-            except Exception as exc:
-                if not self.buffer_while_offline:
-                    raise
-                self._outbound_buffer.append((type, fields, exc))
+            if group in self.buffer_group:
+                clock = self.clock.forward()
+                event = Event(type, hostname=self.hostname,
+                              utcoffset=utcoffset(),
+                              pid=self.pid, clock=clock, **fields)
+                buf = self._group_buffer[group]
+                buf.append(event)
+                if len(buf) >= self.buffer_limit:
+                    self.flush()
+                elif self.on_send_buffered:
+                    self.on_send_buffered()
+            else:
+                return self.publish(type, fields, self.producer, blind)
 
-    def flush(self):
+    def flush(self, errors=True, groups=True):
         """Flushes the outbound buffer."""
-        while self._outbound_buffer:
+        if errors:
+            buf = list(self._outbound_buffer)
             try:
-                type, fields, _ = self._outbound_buffer.popleft()
-            except IndexError:
-                return
-            self.send(type, **fields)
+                with self.mutex:
+                    for event, routing_key, _ in buf:
+                        self._publish(event, self.producer, routing_key)
+            finally:
+                self._outbound_buffer.clear()
+        if groups:
+            with self.mutex:
+                for group, events in items(self._group_buffer):
+                    self._publish(events, self.producer, '%s.multi' % group)
+                    events[:] = []  # list.clear
 
     def extend_buffer(self, other):
         """Copies the outbound buffer of another instance."""
@@ -282,7 +297,7 @@ class EventReceiver(ConsumerMixin):
 
     def __init__(self, channel, handlers=None, routing_key='#',
                  node_id=None, app=None, queue_prefix='celeryev',
-                 accept=None):
+                 accept=None, queue_ttl=None, queue_expires=None):
         self.app = app_or_default(app or self.app)
         self.channel = maybe_channel(channel)
         self.handlers = {} if handlers is None else handlers
@@ -290,12 +305,15 @@ class EventReceiver(ConsumerMixin):
         self.node_id = node_id or uuid()
         self.queue_prefix = queue_prefix
         self.exchange = get_exchange(self.connection or self.app.connection())
-        self.queue = Queue('.'.join([self.queue_prefix, self.node_id]),
-                           exchange=self.exchange,
-                           routing_key=self.routing_key,
-                           auto_delete=True,
-                           durable=False,
-                           queue_arguments=self._get_queue_arguments())
+        self.queue = Queue(
+            '.'.join([self.queue_prefix, self.node_id]),
+            exchange=self.exchange,
+            routing_key=self.routing_key,
+            auto_delete=True, durable=False,
+            queue_arguments=self._get_queue_arguments(
+                ttl=queue_ttl, expires=queue_expires,
+            ),
+        )
         self.clock = self.app.clock
         self.adjust_clock = self.clock.adjust
         self.forward_clock = self.clock.forward
@@ -303,11 +321,16 @@ class EventReceiver(ConsumerMixin):
             accept = {self.app.conf.CELERY_EVENT_SERIALIZER, 'json'}
         self.accept = accept
 
-    def _get_queue_arguments(self):
+    def _get_queue_arguments(self, ttl=None, expires=None):
         conf = self.app.conf
         return dictfilter({
-            'x-message-ttl': maybe_s_to_ms(conf.CELERY_EVENT_QUEUE_TTL),
-            'x-expires': maybe_s_to_ms(conf.CELERY_EVENT_QUEUE_EXPIRES),
+            'x-message-ttl': maybe_s_to_ms(
+                ttl if ttl is not None else conf.CELERY_EVENT_QUEUE_TTL,
+            ),
+            'x-expires': maybe_s_to_ms(
+                expires if expires is not None
+                else conf.CELERY_EVENT_QUEUE_EXPIRES,
+            ),
         })
 
     def process(self, type, event):
@@ -370,8 +393,12 @@ class EventReceiver(ConsumerMixin):
         body['local_received'] = now()
         return type, body
 
-    def _receive(self, body, message):
-        self.process(*self.event_from_message(body))
+    def _receive(self, body, message, list=list, isinstance=isinstance):
+        if isinstance(body, list):  # 3.2: List of events
+            process, from_message = self.process, self.event_from_message
+            [process(*from_message(event)) for event in body]
+        else:
+            self.process(*self.event_from_message(body))
 
     @property
     def connection(self):
